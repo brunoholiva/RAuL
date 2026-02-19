@@ -89,8 +89,8 @@ def set_seed(seed):
 
 def top_k_logits(logits, k):
     v, ix = torch.topk(logits, k)
-    out = logits.clone()
-    out[out < v[:, [-1]]] = -float('Inf')
+    out = torch.full_like(logits, float('-inf'))
+    out.scatter_(dim=-1, index=ix, src=v)
     return out
 
 def to_tensor(tensor):

@@ -8,7 +8,7 @@ import joblib
 from utils.rdkit_utils import (
     _smiles_to_fp
 )
-
+import torch
 
 _SASCORER = None
 def _get_sascorer():
@@ -68,40 +68,38 @@ def qed_score(smiles=None, mol=None):
     except Exception:
         return 0.0
 
+_AD_TRAIN_FPS_TENSOR = None
+_AD_TRAIN_FPS_SUM = None
+
 
 def load_ad_nn(path):
     """
     Load the AD nearest neighbor model from the given path.
-
-    :param path: Path to the saved AD NN model (joblib format).
-    :return: The loaded AD NN model.
-
     """
-    global _AD_NN, _AD_META
+    global _AD_NN, _AD_META, _AD_TRAIN_FPS_TENSOR, _AD_TRAIN_FPS_SUM
     obj = joblib.load(path)
+    
     if isinstance(obj, dict):
         _AD_NN = obj.get("nn")
         _AD_META["radius"] = obj.get("radius", 2)
         _AD_META["n_bits"] = obj.get("n_bits", 2048)
+        
+        # Extract raw fingerprints and send them to the GPU
+        raw_fps = obj.get("fps")
+        if raw_fps is not None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # Convert to float32 for fast matrix multiplication
+            t_fps = torch.tensor(raw_fps, dtype=torch.float32, device=device)
+            _AD_TRAIN_FPS_TENSOR = t_fps
+            _AD_TRAIN_FPS_SUM = t_fps.sum(dim=1)
+            
     else:
         _AD_NN = obj
     return _AD_NN
 
 
 def ad_domain_score(smiles_list, fps=None, default_score=1.0, n_neighbors=5):
-    """
-    Compute the AD (applicability domain) score for a list of SMILES strings.
-    The bigger the score, the farther it is from the training set (less applicable).
-
-
-    :param smiles_list: List of SMILES strings
-    :param fps: Precomputed fingerprints (optional)
-    :param default_score: Default score to use if AD NN model is not loaded
-    :param n_neighbors: Number of neighbors to consider in the AD NN model
-    :return: Numpy array of AD scores
-
-    """
-    if _AD_NN is None:
+    if _AD_TRAIN_FPS_TENSOR is None and _AD_NN is None:
         return np.full(len(smiles_list), default_score, dtype=np.float32)
 
     scores = np.full(len(smiles_list), default_score, dtype=np.float32)
@@ -123,7 +121,39 @@ def ad_domain_score(smiles_list, fps=None, default_score=1.0, n_neighbors=5):
     if len(fps_list) == 0:
         return scores
 
-    fps_arr = np.stack(fps_list, axis=0).astype(bool)
+    fps_arr = np.stack(fps_list, axis=0)
+
+    # ---------------------------------------------------------
+    # NEW FAST GPU CALCULATION
+    # ---------------------------------------------------------
+    if _AD_TRAIN_FPS_TENSOR is not None:
+        device = _AD_TRAIN_FPS_TENSOR.device
+        with torch.no_grad():
+            batch_t = torch.tensor(fps_arr, dtype=torch.float32, device=device)
+            batch_sum = batch_t.sum(dim=1) 
+            
+            # 1. Intersection (A AND B) = Dot Product
+            intersection = torch.matmul(batch_t, _AD_TRAIN_FPS_TENSOR.T) 
+            
+            # 2. Union (A OR B) = Sum(A) + Sum(B) - Intersection
+            union = batch_sum.unsqueeze(1) + _AD_TRAIN_FPS_SUM.unsqueeze(0) - intersection
+            
+            # 3. Tanimoto Similarity
+            tanimoto = intersection / (union + 1e-8)
+            
+            # 4. Jaccard Distance = 1 - Tanimoto
+            # We want the 5 SMALLEST distances, which means the 5 LARGEST similarities
+            topk_sim, _ = torch.topk(tanimoto, k=n_neighbors, dim=1, largest=True)
+            topk_dist = 1.0 - topk_sim
+            
+            mean_dist = topk_dist.mean(dim=1).cpu().numpy()
+            
+        for i, d in zip(valid_idx, mean_dist):
+            scores[i] = float(d)
+            
+        return scores
+
+    fps_arr = fps_arr.astype(bool)
     distances, _ = _AD_NN.kneighbors(fps_arr, n_neighbors=n_neighbors, return_distance=True)
     mean_dist = distances.mean(axis=1).astype(np.float32)
 
