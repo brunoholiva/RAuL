@@ -1,0 +1,13 @@
+__pycache__/
+*.log
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.tfevents*
+/data/pretrain/
+/data/predictor/*.csv
+/data/predictor/*.joblib
+*.txt
+*ipynb

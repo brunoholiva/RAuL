@@ -1,0 +1,32 @@
+[model]
+n_layer = 8
+n_head = 8
+n_embd = 256
+max_length = 200
+
+[training]
+batch_size = 300
+max_steps = 5000
+learning_rate = 1e-5
+temperature = 1.0
+top_k = 10
+
+[reward]
+w_rf = 3
+w_qed = 1
+w_sa = 1
+sigma = 120
+
+[evaluation]
+eval_every = 50
+
+[paths]
+vocab_path = "data/vocab.txt"
+ckpt_load_path = "runs/checkpoints/pretrain/epoch9.pt"
+ckpt_save_path = "runs/checkpoints/"
+rf_model_path = "data/predictor/rf_morgan_butina.joblib"
+ad_nn_path = "data/predictor/nn_neighbor_ecoli_chembl.joblib"
+train_smiles_path = "data/pretrain/unique_chembl_smiles_200.txt"
+
+[run]
+run_name = "exp4"
