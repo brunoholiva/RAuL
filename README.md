@@ -1,6 +1,8 @@
-# reinforce
+# RAuL
 
-Reinforcement learning and pretraining for SMILES-based molecule generation.
+Reinforcement Antibiotic Learner
+
+Reinforcement learning and pretraining for SMILES-based antimicrobial molecule generation.
 
 ## Layout
 
