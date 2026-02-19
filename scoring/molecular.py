@@ -123,9 +123,7 @@ def ad_domain_score(smiles_list, fps=None, default_score=1.0, n_neighbors=5):
 
     fps_arr = np.stack(fps_list, axis=0)
 
-    # ---------------------------------------------------------
-    # NEW FAST GPU CALCULATION
-    # ---------------------------------------------------------
+
     if _AD_TRAIN_FPS_TENSOR is not None:
         device = _AD_TRAIN_FPS_TENSOR.device
         with torch.no_grad():
