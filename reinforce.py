@@ -16,12 +16,11 @@ from utils.utils import (
     model_diversity,
     sample_SMILES
 )
-from utils.rdkit_utils import preprocess_smiles_list
-from scoring.molecular import load_ad_nn
-from scoring.activity import init_rf_model
+from scoring.molecular import load_ad_nn, ad_domain_score
+from scoring.activity import init_rf_model, predict_activity_proba
 from scoring.reward import (
     compute_reward,
-    compute_property_scores,
+    parallel_process_batch,
     apply_diversity_filter,
     update_replay_buffer,
     sample_replay_buffer
@@ -165,11 +164,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Load config from TOML file
     with open(args.config, "r") as f:
         config = toml.load(f)
     
-    # Extract sections
     model_cfg = config["model"]
     training_cfg = config["training"]
     reward_cfg = config["reward"]
@@ -249,30 +246,27 @@ def main():
             top_k=training_cfg["top_k"],
         )
 
-        # Agent log-probs
         logprobs, _, _ = logprobs_from_codes(model, codes, voc, train_mode=True)
 
-        # Prior log-probs
         with torch.no_grad():
             logprobs_ref, _, _ = logprobs_from_codes(ref_model, codes, voc, train_mode=False)
 
-        # 1. Compute Reward for the ONLINE batch
+        processed_data = parallel_process_batch(smiles_list, max_workers=training_cfg["max_workers"])
+        
         reward = compute_reward(
-            smiles_list,
+            processed_data,
             w_rf=reward_cfg["w_rf"],
             w_qed=reward_cfg["w_qed"],
             w_sa=reward_cfg["w_sa"],
         )
         
-        # 2. Apply Filter
         filtered_reward = apply_diversity_filter(
-            smiles_list, 
+            processed_data, 
             reward, 
             global_scaffold_memory, 
             bucket_size=25 
         )
         
-        # Convert to tensor
         score = torch.tensor(filtered_reward, dtype=torch.float32, device=device)
         
         replay_buffer = update_replay_buffer(
@@ -310,22 +304,31 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        # logging
         writer.add_scalar("loss/dap", float(loss.item()), step)
         writer.add_scalar("reward/mean", float(total_scores.mean().item()), step)
         writer.add_scalar("reward/max", float(total_scores.max().item()), step)
         writer.add_scalar("reward/min", float(total_scores.min().item()), step)
-        
-        # log AD and RF distributions from current batch
-        if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
-            std_smiles, mols, valid_mask = preprocess_smiles_list(smiles_list)
-            rf_probs, qed_scores, sa_raw, ad_dists = compute_property_scores(std_smiles, mols)
 
-            mask = np.array(valid_mask, dtype=bool)
-            rf_valid = np.array(rf_probs, dtype=np.float32)[mask]
-            ad_valid = np.array(ad_dists, dtype=np.float32)[mask]
-            qed_valid = np.array(qed_scores, dtype=np.float32)[mask]
-            sa_valid = np.array(sa_raw, dtype=np.float32)[mask]
+        if (step + 1) % 500 == 0:
+            ckpt_path = os.path.join(ckpt_save_dir, f"step_{step+1}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+
+        if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
+            mask = np.array([d["valid"] for d in processed_data], dtype=bool)
+            
+            qed_scores = np.array([d.get("qed", 0.0) for d in processed_data], dtype=np.float32)
+            sa_raw = np.array([d.get("sa", 10.0) for d in processed_data], dtype=np.float32)
+            
+            fps = [d["fp"] for d in processed_data]
+            std_smiles = [d.get("std_smi", "") for d in processed_data]
+            
+            rf_probs = predict_activity_proba(fps)
+            ad_dists = ad_domain_score(std_smiles, fps=fps)
+
+            rf_valid = rf_probs[mask]
+            ad_valid = ad_dists[mask]
+            qed_valid = qed_scores[mask]
+            sa_valid = sa_raw[mask]
 
             if rf_valid.size > 0:
                 writer.add_histogram("rf/prob_dist", rf_valid, step)
@@ -336,13 +339,6 @@ def main():
             if sa_valid.size > 0:
                 writer.add_histogram("sa/score_dist", sa_valid, step)
 
-        if step % 500 == 0:
-            torch.save(
-                model.state_dict(),
-                os.path.join(ckpt_save_dir, f"step{step}.pt"),
-            )
-
-        if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
             sampled_smiles, _, _ = sample_SMILES(model, voc=voc, n_mols=100, block_size=200, top_k=10)
             validity = model_validity(sampled_smiles)
             uniqueness = model_uniqueness(sampled_smiles)
@@ -361,7 +357,7 @@ def main():
                 idx = np.random.choice(len(valid_mols), size=k, replace=False)
                 mols_subset = [valid_mols[i] for i in idx]
                 img = Draw.MolsToGridImage(mols_subset, molsPerRow=4, subImgSize=(200, 200))
-                img_np = np.array(img)  # HWC RGB
+                img_np = np.array(img)
                 writer.add_image("samples/molecules", img_np, step, dataformats="HWC")
 
 
