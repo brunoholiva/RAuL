@@ -6,10 +6,11 @@ max_length = 200
 
 [training]
 batch_size = 300
-max_steps = 5000
+max_steps = 3500
 learning_rate = 1e-5
 temperature = 1.0
 top_k = 10
+max_workers = 8
 
 [reward]
 w_rf = 3
@@ -29,4 +30,4 @@ ad_nn_path = "data/predictor/nn_neighbor_ecoli_chembl.joblib"
 train_smiles_path = "data/pretrain/unique_chembl_smiles_200.txt"
 
 [run]
-run_name = "exp4"
+run_name = "exp5"

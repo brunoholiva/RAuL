@@ -1,7 +1,8 @@
 import numpy as np
 from rdkit import Chem
+from rdkit.Chem import Descriptors
 from utils.utils import sigmoid, reverse_sigmoid
-from utils.rdkit_utils import get_scaffold, preprocess_smiles_list, _mol_to_fp
+from utils.rdkit_utils import get_scaffold, process_smiles, _mol_to_fp
 from scoring.activity import predict_activity_proba
 from scoring.molecular import (
     sa_score,
@@ -11,127 +12,158 @@ from scoring.molecular import (
 )
 from pretraining.vocabulary import SMILESTokenizer
 import torch
+import concurrent.futures
 
-
-def compute_property_scores(std_smiles, mols):
+def process_single_molecule(smi):
     """
-    Compute the property scores (RF activity, QED, SA, AD) for a list of standardized SMILES 
-    and their corresponding Mol objects.
+    This function does all the heavy RDKit lifting for ONE molecule.
+    It returns a dictionary of basic data types so Python can easily 
+    send it back to the main process.
+    """
+    std_smi = process_smiles(smi)
+    if not std_smi:
+        return {"valid": False, "smi": smi, "fp": None, "canon_smi": None, "scaffold": None}
     
-    :param std_smiles: List of standardized SMILES strings
-    :param mols: List of RDKit Mol objects
-    :return: Tuple containing RF scores, QED scores, SA scores, and AD scores
+    mol = Chem.MolFromSmiles(std_smi)
+    if not mol:
+        return {"valid": False, "smi": smi, "fp": None, "canon_smi": None, "scaffold": None}
+
+    canon_smi = Chem.MolToSmiles(mol)
+    
+    return {
+        "valid": True,
+        "smi": smi,
+        "std_smi": std_smi,
+        "canon_smi": canon_smi,
+        "qed": qed_score(mol=mol),
+        "sa": sa_score(mol=mol),
+        "mw": Descriptors.MolWt(mol),
+        "fp": _mol_to_fp(mol),
+        "scaffold": get_scaffold(canon_smi)
+    }
+
+
+def parallel_process_batch(smiles_list, max_workers=None):
     """
-    rf_scores = predict_activity_proba(std_smiles)
-
-    qed_scores = np.array(
-        [qed_score(mol=m) for m in mols],
-        dtype=np.float32,
-    )
-
-    sa_raw = np.array(
-        [sa_score(mol=m) for m in mols],
-        dtype=np.float32,
-    )
-
-    fps = [_mol_to_fp(m) for m in mols]
-    ad_scores = ad_domain_score(std_smiles, fps=fps)
-
-    return rf_scores, qed_scores, sa_raw, ad_scores
-
-
-
-def compute_reward(smiles_list, w_rf=4.0, w_qed=1.0, w_sa=1.0):
+    Takes a list of 300 SMILES and splits them across all available CPU cores.
     """
-    Reward function with GATED Activity Score.
-    AD Score acts as a trust gate: Reward = (RF * AD_Trust) + QED + SA
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(process_single_molecule, smiles_list))
+    return results
+
+
+def compute_reward(processed_data, w_rf=4.0, w_qed=1.0, w_sa=1.0):
     """
-    # 1. Preprocess
-    std_smiles, mols, valid_mask = preprocess_smiles_list(smiles_list)
+    Calculates rewards using the pre-computed data from the parallel workers.
+    """
+    n_mols = len(processed_data)
+    
+    # Extract lists from our parallel results
+    valid_mask = np.array([1.0 if d["valid"] else 0.0 for d in processed_data], dtype=np.float32)
+    fps = [d["fp"] for d in processed_data]
+    std_smiles = [d["std_smi"] if d["valid"] else "" for d in processed_data]
+    
+    # Default values for invalid molecules (will be zeroed out by valid_mask anyway)
+    qed_vals = np.array([d.get("qed", 0.0) for d in processed_data], dtype=np.float32)
+    sa_vals = np.array([d.get("sa", 10.0) for d in processed_data], dtype=np.float32)
+    mw_weights = np.array([d.get("mw", 600.0) for d in processed_data], dtype=np.float32)
 
-    # 2. Compute Raw Values
-    rf_probs = predict_activity_proba(std_smiles)
-    qed_vals = np.array([qed_score(mol=m) for m in mols], dtype=np.float32)
-    sa_vals = np.array([sa_score(mol=m) for m in mols], dtype=np.float32)
-    mw_weights = get_mw(mols=mols)
-
-    fps = [_mol_to_fp(m) for m in mols]
+    # ML Models run incredibly fast on vectorized Numpy arrays in the main thread
+    rf_probs = predict_activity_proba(fps)
     ad_dists = ad_domain_score(std_smiles, fps=fps)
 
-    # 3. Apply Transforms
+    # Apply Transforms
     score_rf = np.array([sigmoid(v, low=0.5, high=0.85) for v in rf_probs], dtype=np.float32)
-    score_ad_trust = np.array([reverse_sigmoid(v, low=0.3, high=0.6) for v in ad_dists], dtype=np.float32)
+    score_ad_trust = np.array([reverse_sigmoid(v, low=0.4, high=0.6) for v in ad_dists], dtype=np.float32)
     score_qed = np.array([sigmoid(v, low=0.4, high=0.8) for v in qed_vals], dtype=np.float32)
     score_sa = np.array([reverse_sigmoid(v, low=3.0, high=6.0) for v in sa_vals], dtype=np.float32)
     score_mw = np.array([reverse_sigmoid(v, low=500, high=600) for v in mw_weights], dtype=np.float32)
-    # 4. Weighted Sum with GATING
+
+    # Weighted Sum with GATING
     term_rf = w_rf * (score_rf * score_ad_trust)
     term_qed = w_qed * score_qed
     term_sa = w_sa * score_sa
 
     raw_total_reward = term_rf + term_qed + term_sa
-
     total_reward = raw_total_reward * score_mw  # Penalize if MW is out of range
 
-    final_rewards = total_reward * np.array(valid_mask, dtype=np.float32)
+    # Zero out invalid molecules
+    final_rewards = total_reward * valid_mask
 
     return final_rewards
 
-
-def apply_diversity_filter(smiles_list, raw_scores, global_memory, bucket_size=25):
+def apply_diversity_filter(processed_data, raw_scores, global_memory, bucket_size=25):
+    """
+    Uses the pre-computed scaffolds so we don't recalculate them here.
+    """
     final_scores = []
-    local_smiles_seen = set()  # Global SMILES memory size 1 logic
+    local_smiles_seen = set()
 
-    for i, (smiles, score) in enumerate(zip(smiles_list, raw_scores)):
-        # Step A: Canonicalize for exact duplicate check
-        mol = Chem.MolFromSmiles(smiles)
-        if not mol:
+    for i, data in enumerate(processed_data):
+        score = raw_scores[i]
+        
+        if not data["valid"]:
             final_scores.append(0.0)
             continue
-        canon_smiles = Chem.MolToSmiles(mol)
 
-        # Step B: Check for exact SMILES repeat (Global SMILES Memory size 1)
+        canon_smiles = data["canon_smi"]
+
+        # Step B: Check for exact SMILES repeat in current batch
         if canon_smiles in local_smiles_seen:
             final_scores.append(0.0)
             continue
         local_smiles_seen.add(canon_smiles)
 
         # Step C: Scaffold Bucket check
-        scaffold = get_scaffold(canon_smiles)
-        if scaffold in global_memory and global_memory[scaffold] >= bucket_size:
+        scaffold = data["scaffold"]
+        if scaffold and scaffold in global_memory and global_memory[scaffold] >= bucket_size:
             final_scores.append(0.0)
         else:
             final_scores.append(score)
-            # Update global memory
-            global_memory[scaffold] = global_memory.get(scaffold, 0) + 1
+            if scaffold:
+                global_memory[scaffold] = global_memory.get(scaffold, 0) + 1
             
     return final_scores
 
 
-def update_replay_buffer(buffer, smiles_list, scores, prior_logprobs, buffer_size=100):
+def update_replay_buffer(buffer, smiles_list, scores, prior_logprobs, buffer_size=100, max_per_scaffold=3):
     """
-    Updates the buffer with new experience.
-    Keeps the buffer sorted by score (highest first) and truncated to buffer_size.
-    
+    Updates the buffer with new experience, enforcing scaffold diversity.
     Structure of buffer item: (score, smiles, prior_logprob)
     """
     # 1. Zip the current batch into tuples
-    # We cast score to float for sorting
     new_items = []
     for sm, sc, plp in zip(smiles_list, scores, prior_logprobs):
-        # Only add valid molecules with non-zero score
         if sc > 0.0:
             new_items.append((float(sc), sm, float(plp.item())))
 
-    # 2. Add to existing buffer
-    buffer.extend(new_items)
+    # 2. Add to existing buffer and sort by score (descending)
+    combined = buffer + new_items
+    combined.sort(key=lambda x: x[0], reverse=True)
 
-    # 3. Sort by score (descending) -> Best molecules first
-    # This is the "Prioritized" part of REINVENT
-    buffer.sort(key=lambda x: x[0], reverse=True)
+    # 3. Filter for intra-buffer diversity
+    diverse_buffer = []
+    scaffold_counts = {}
 
-    # 4. Keep only the top N
-    return buffer[:buffer_size]
+    for item in combined:
+        score, smi, prior = item
+        scaffold = get_scaffold(smi)
+        
+        # If it's a valid scaffold, check its count
+        if scaffold:
+            count = scaffold_counts.get(scaffold, 0)
+            if count < max_per_scaffold:
+                diverse_buffer.append(item)
+                scaffold_counts[scaffold] = count + 1
+        else:
+            # If get_scaffold fails, just add it (or you can choose to skip)
+            diverse_buffer.append(item)
+
+        # Stop once we hit the buffer size
+        if len(diverse_buffer) >= buffer_size:
+            break
+
+    return diverse_buffer
 
 import random
 

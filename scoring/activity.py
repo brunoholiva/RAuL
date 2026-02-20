@@ -25,25 +25,23 @@ def morgan_fingerprint(smiles):
     return np.array(fp, dtype=np.float32)
 
 
-def predict_activity_proba(smiles_list):
+def predict_activity_proba(fps_list):
     """
-    Predict activity probabilities for a list of SMILES strings using the loaded RF model.
+    Predict activity probabilities for a list of FPS  using the loaded RF model.
 
-    :param smiles_list: List of SMILES strings
-    :return: NumPy array of probabilities (0.0 for invalid SMILES)
+    :param fps_list: List of FPS vectors
+    :return: NumPy array of probabilities (0.0 for invalid FPS)
     """
     if rf_model is None:
-        raise RuntimeError("RF model not loaded")
+            raise RuntimeError("RF model not loaded")
 
-    features = [morgan_fingerprint(smi) for smi in smiles_list]
-    valid_idx = [i for i, fp in enumerate(features) if fp is not None]
-
-    proba_full = np.zeros(len(smiles_list), dtype=np.float32)
+    proba_full = np.zeros(len(fps_list), dtype=np.float32)
+        
+    valid_idx = [i for i, fp in enumerate(fps_list) if fp is not None]
 
     if valid_idx:
-        # Only predict on valid SMILES
         import pandas as pd
-        df_features = pd.DataFrame([features[i] for i in valid_idx])
+        df_features = pd.DataFrame([fps_list[i] for i in valid_idx])
         probabilities = rf_model.predict_proba(df_features)[:, 1]  # positive class
         for out_i, i in enumerate(valid_idx):
             proba_full[i] = float(probabilities[out_i])
