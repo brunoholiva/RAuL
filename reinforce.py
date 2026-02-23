@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from pretraining.model import GPT, GPTConfig
 from pretraining.vocabulary import read_vocabulary
-from scoring.activity import init_rf_model, predict_activity_proba
+from scoring.activity import load_rf_model, predict_activity_proba
 from scoring.molecular import ad_domain_score, load_ad_model
 from scoring.reward import (
     apply_diversity_filter,
@@ -138,7 +138,7 @@ def main():
     run_cfg = config["run"]
 
     global_scaffold_memory = OrderedDict()    
-    init_rf_model(paths_cfg["rf_model_path"])
+    rf_model = load_rf_model(paths_cfg["rf_model_path"])
     ad_model = load_ad_model(path=paths_cfg["ad_nn_path"], device=device)
     train_smiles_set = load_smiles_set(paths_cfg.get("train_smiles_path"))
 
@@ -226,7 +226,8 @@ def main():
 
         reward = compute_reward(
             processed_data,
-            ad_model,
+            ad_model=ad_model,
+            rf_model=rf_model,
             w_rf=reward_cfg["w_rf"],
             w_qed=reward_cfg["w_qed"],
             w_sa=reward_cfg["w_sa"],
@@ -303,7 +304,7 @@ def main():
             fps = [d["fp"] for d in processed_data]
             std_smiles = [d.get("std_smi", "") for d in processed_data]
 
-            rf_probs = predict_activity_proba(fps)
+            rf_probs = predict_activity_proba(fps, rf_model=rf_model)
             ad_dists = ad_domain_score(fps, ad_model=ad_model)
 
             rf_valid = rf_probs[mask]

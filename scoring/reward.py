@@ -90,7 +90,7 @@ def parallel_process_batch(smiles_list, max_workers=None):
     return results
 
 
-def compute_reward(processed_data, ad_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
+def compute_reward(processed_data, ad_model, rf_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
     """
     Calculates rewards using the pre-computed data from the parallel workers.
 
@@ -100,6 +100,8 @@ def compute_reward(processed_data, ad_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
         The list of dictionaries pre-computed by parallel_process_batch.
     ad_model : Dict[str, Any]
         The dictionary containing the loaded AD model and tensors.
+    rf_model : Any
+        The loaded random forest model.
     w_rf : float, optional
         The weight for the random forest activity score (default is 3.0).
     w_qed : float, optional
@@ -132,7 +134,7 @@ def compute_reward(processed_data, ad_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
         [d.get("pains_ok", 1.0) for d in processed_data], dtype=np.float32
     )
 
-    rf_probs = predict_activity_proba(fps)
+    rf_probs = predict_activity_proba(fps, rf_model=rf_model)
     ad_dists = ad_domain_score(fps=fps, ad_model=ad_model)
 
     score_rf = np.array(
