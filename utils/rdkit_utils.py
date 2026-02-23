@@ -10,7 +10,6 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import AllChem
 from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit.Chem.Scaffolds import MurckoScaffold
-from tdc import Evaluator
 
 UNCHARGER = rdMolStandardize.Uncharger()
 TAUTOMER_ENUMERATOR = rdMolStandardize.TautomerEnumerator()
@@ -334,7 +333,7 @@ def model_diversity(smiles_list: List[str]) -> float:
 
 def model_validity(smiles_list: List[str]) -> float:
     """
-    Calculate the proportion of valid SMILES using TDC Evaluator.
+    Calculate the proportion of valid SMILES using native RDKit.
 
     Parameters:
     -----------
@@ -346,5 +345,9 @@ def model_validity(smiles_list: List[str]) -> float:
     float
         The validity score (0.0 to 1.0).
     """
-    evaluator = Evaluator(name="Validity")
-    return float(evaluator(smiles_list))
+    if not smiles_list:
+        return 0.0
+    
+    valid_count = sum(1 for s in smiles_list if is_valid_smiles(s))
+    
+    return valid_count / len(smiles_list)
