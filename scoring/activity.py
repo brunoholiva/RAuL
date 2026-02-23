@@ -1,10 +1,14 @@
 from typing import Any, List, Optional
-
+import warnings
 import joblib
 import numpy as np
 import numpy.typing as npt
 
 rf_model = None
+
+warnings.filterwarnings(
+    "ignore", message="X does not have valid feature names"
+)
 
 
 def load_rf_model(path: str) -> Any:
