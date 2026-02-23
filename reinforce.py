@@ -1,4 +1,5 @@
 import argparse
+from typing import Any, Optional, Set, Tuple
 import os
 from collections import OrderedDict
 import numpy as np
@@ -30,26 +31,41 @@ from utils.rdkit_utils import (
 
 
 def create_model(
-    voc,
-    n_layer,
-    n_head,
-    n_embd,
-    max_length,
-    learning_rate,
-    device,
-    ckpt_load_path=None,
-):
+    voc: Any,
+    n_layer: int,
+    n_head: int,
+    n_embd: int,
+    max_length: int,
+    learning_rate: float,
+    device: str,
+    ckpt_load_path: Optional[str] = None,
+)-> Tuple[GPT, torch.optim.Optimizer]:
     """
-    Create the GPT model and optimizer.
+    Creates the GPT model and optimizer.
 
-    :param voc: Vocabulary object
-    :param n_layer: Number of layers in the model
-    :param n_head: Number of attention heads
-    :param n_embd: Embedding dimension
-    :param max_length: Maximum sequence length
-    :param learning_rate: Learning rate for the optimizer
-    :param device: Device to run the model on
-    :param ckpt_load_path: Path to load checkpoint from
+    Parameters
+    ----------
+    voc : Any
+        The vocabulary object containing token mappings.
+    n_layer : int
+        The number of transformer layers.
+    n_head : int
+        The number of attention heads.
+    n_embd : int
+        The embedding dimension.
+    max_length : int
+        The maximum sequence length (block size).
+    learning_rate : float
+        The learning rate for the optimizer.
+    device : str
+        The device to run the model on (e.g., "cuda" or "cpu").
+    ckpt_load_path : Optional[str], optional
+        The path to a checkpoint to load model weights from (default is None).
+    
+    Returns
+    -------
+    Tuple[GPT, torch.optim.Optimizer]
+        The created GPT model and its optimizer.
     """
     model_config = GPTConfig(
         voc.__len__(),
@@ -70,17 +86,71 @@ def create_model(
     return model, optimizer
 
 
-def _sequence_mask(target, eos_token_id):
+def _sequence_mask(
+    target: torch.Tensor, eos_token_id: int
+) -> torch.Tensor:
+    """
+    Create a binary mask identifying valid tokens before the EOS token.
+
+    Parameters
+    ----------
+    target : torch.Tensor
+        The target sequence tensor.
+    eos_token_id : int
+        The integer ID of the End-Of-Sequence token.
+
+    Returns
+    -------
+    torch.Tensor
+        A binary float tensor where 1.0 indicates a valid token and 0.0
+        indicates padding/EOS.
+    """
     eos = target == eos_token_id
     return (eos.cumsum(dim=1) == 0).float()
 
 
-def _token_logprobs(logits, target):
+def _token_logprobs(
+    logits: torch.Tensor, target: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculate the log probabilities of the target tokens from logits.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        The raw logits output from the model.
+    target : torch.Tensor
+        The target token indices.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The full log-softmax tensor and the specific log probabilities
+        gathered for the target tokens.
+    """
     log_probs = logits.log_softmax(dim=-1)
-    return log_probs, log_probs.gather(2, target.unsqueeze(-1)).squeeze(-1)
+    gathered_logprobs = log_probs.gather(2, target.unsqueeze(-1)).squeeze(-1)
+    return log_probs, gathered_logprobs
 
 
-def _sequence_entropy(logits, not_finished):
+def _sequence_entropy(
+    logits: torch.Tensor, not_finished: torch.Tensor
+) -> torch.Tensor:
+    """
+    Calculate the mean Shannon entropy of the generated sequence.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        The raw logits output from the model.
+    not_finished : torch.Tensor
+        The binary mask identifying valid tokens.
+
+    Returns
+    -------
+    torch.Tensor
+        A scalar tensor representing the mean entropy of valid tokens.
+    """
     log_probs = logits.log_softmax(dim=-1)
     probs = log_probs.exp()
     token_entropy = -(probs * log_probs).sum(dim=-1)
@@ -89,14 +159,35 @@ def _sequence_entropy(logits, not_finished):
     return (token_entropy.sum(dim=1) / seq_lengths).mean()
 
 
-def logprobs_from_codes(model, codes, voc, train_mode=True):
+def logprobs_from_codes(
+    model: torch.nn.Module, codes: torch.Tensor, voc: Any, train_mode: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute log probabilities and entropy for a batch of token codes.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The GPT model.
+    codes : torch.Tensor
+        The token sequences to evaluate.
+    voc : Any
+        The vocabulary object.
+    train_mode : bool, default=True
+        Whether to set the model to train mode.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        Sequence log probabilities, sequence entropy, and value estimates.
+    """
     model.train() if train_mode else model.eval()
     logits, values, _ = model(codes[:, :-1])
 
     target = codes[:, 1:]
     not_finished = _sequence_mask(target, voc["$"])
 
-    log_probs, token_logprobs = _token_logprobs(logits, target)
+    _, token_logprobs = _token_logprobs(logits, target)
     token_logprobs = token_logprobs * not_finished
     logprobs = token_logprobs.sum(dim=1)
 
@@ -105,7 +196,20 @@ def logprobs_from_codes(model, codes, voc, train_mode=True):
     return logprobs, entropy, values
 
 
-def load_smiles_set(path):
+def load_smiles_set(path: Optional[str]) -> Optional[Set[str]]:
+    """
+    Load a set of SMILES strings from a text file for fast lookup.
+
+    Parameters
+    ----------
+    path : Optional[str]
+        The file path to the SMILES list.
+
+    Returns
+    -------
+    Optional[Set[str]]
+        A set containing the SMILES strings, or None if path is None.
+    """
     if path is None:
         return None
     smiles_set = set()
@@ -117,7 +221,10 @@ def load_smiles_set(path):
     return smiles_set
 
 
-def main():
+def main()-> None: 
+    """
+    Main training loop for the RAuL reinforcement learning pipeline.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     parser = argparse.ArgumentParser()
