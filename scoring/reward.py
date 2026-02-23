@@ -7,9 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from rdkit import Chem
-from rdkit.Chem import Descriptors, AllChem
-from rdkit import DataStructs
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem, Descriptors
 
 from pretraining.vocabulary import SMILESTokenizer, Vocabulary
 from scoring.activity import predict_activity_proba
@@ -107,7 +106,7 @@ def compute_reward(processed_data, ad_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
         The weight for the QED score (default is 1.0).
     w_sa : float, optional
         The weight for the SA score (default is 1.0).
-    
+
     Returns
     -------
     List[float]
@@ -134,7 +133,7 @@ def compute_reward(processed_data, ad_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
     )
 
     rf_probs = predict_activity_proba(fps)
-    ad_dists = ad_domain_score(fps=fps,ad_model=ad_model)
+    ad_dists = ad_domain_score(fps=fps, ad_model=ad_model)
 
     score_rf = np.array(
         [sigmoid(v, low=0.5, high=0.85) for v in rf_probs], dtype=np.float32
@@ -230,7 +229,7 @@ def apply_diversity_filter(
             continue
 
         scaffold_smi = data.get("scaffold_smi")
-        scaffold_fp = data.get("scaffold_fp")  
+        scaffold_fp = data.get("scaffold_fp")
         if scaffold_smi is None or scaffold_fp is None:
             final_scores.append(0.0)
             continue

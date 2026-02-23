@@ -3,14 +3,13 @@
 import os
 import sys
 from typing import Any, Dict, List, Optional
-import numpy as np
-import numpy.typing as npt
+
 import joblib
 import numpy as np
+import numpy.typing as npt
 import torch
 from rdkit import Chem
 from rdkit.Chem import QED, FilterCatalog
-from rdkit.Chem import FilterCatalog
 
 _SASCORER = None
 
@@ -36,7 +35,9 @@ def _get_pains_catalog() -> FilterCatalog.FilterCatalog:
     global _PAINS_CATALOG
     if _PAINS_CATALOG is None:
         params = FilterCatalog.FilterCatalogParams()
-        params.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS)
+        params.AddCatalog(
+            FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS
+        )
         _PAINS_CATALOG = FilterCatalog.FilterCatalog(params)
     return _PAINS_CATALOG
 
@@ -104,13 +105,13 @@ def load_ad_model(path: str, device: torch.device) -> Dict[str, Any]:
         and pre-loaded PyTorch tensors for fast matrix multiplication.
     """
     obj = joblib.load(path)
-    
+
     ad_model = {
         "nn": None,
         "radius": 2,
         "n_bits": 2048,
         "train_fps_tensor": None,
-        "train_fps_sum": None
+        "train_fps_sum": None,
     }
 
     if isinstance(obj, dict):
@@ -160,7 +161,7 @@ def ad_domain_score(
 
     valid_idx = []
     valid_fps = []
-    
+
     for i, fp in enumerate(fps):
         if fp is not None:
             valid_fps.append(fp)
@@ -209,6 +210,7 @@ def ad_domain_score(
             scores[i] = float(d)
 
     return scores
+
 
 def passes_pains(mol: Optional[Chem.rdchem.Mol]) -> bool:
     """
