@@ -1,40 +1,47 @@
-import os
 import argparse
+import os
+from collections import OrderedDict
 import numpy as np
-from tqdm import tqdm
-import torch
-from torch.utils.tensorboard import SummaryWriter
 import toml
-from pretraining.vocabulary import SMILESTokenizer, read_vocabulary
-from pretraining.model import GPT, GPTConfig
-from utils.utils import (
-    set_seed,
-    top_k_logits,
-    model_validity,
-    model_uniqueness,
-    model_novelty,
-    model_diversity,
-    sample_SMILES
-)
-from scoring.molecular import load_ad_nn, ad_domain_score
-from scoring.activity import init_rf_model, predict_activity_proba
-from scoring.reward import (
-    compute_reward,
-    parallel_process_batch,
-    apply_diversity_filter,
-    update_replay_buffer,
-    sample_replay_buffer
-)
+import torch
 from rdkit import Chem
 from rdkit.Chem import Draw
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from pretraining.model import GPT, GPTConfig
+from pretraining.vocabulary import SMILESTokenizer, read_vocabulary
+from scoring.activity import init_rf_model, predict_activity_proba
+from scoring.molecular import ad_domain_score, load_ad_nn
+from scoring.reward import (
+    apply_diversity_filter,
+    compute_reward,
+    parallel_process_batch,
+    sample_replay_buffer,
+    update_replay_buffer,
+)
+from utils.utils import set_seed, sample_smiles_nograd
+from utils.rdkit_utils import (
+    model_diversity,
+    model_novelty,
+    model_uniqueness,
+    model_validity
+)
 
 
 def create_model(
-    voc, n_layer, n_head, n_embd, max_length, learning_rate, device, ckpt_load_path=None
+    voc,
+    n_layer,
+    n_head,
+    n_embd,
+    max_length,
+    learning_rate,
+    device,
+    ckpt_load_path=None,
 ):
     """
     Create the GPT model and optimizer.
-    
+
     :param voc: Vocabulary object
     :param n_layer: Number of layers in the model
     :param n_head: Number of attention heads
@@ -57,58 +64,10 @@ def create_model(
     )
     if ckpt_load_path is not None:
         print(f"Loading checkpoint from {ckpt_load_path}")
-        model.load_state_dict(torch.load(ckpt_load_path, map_location=device), strict=False)
-    return model, optimizer
-
-
-def sample_smiles_nograd(model, voc, n_mols, block_size, temperature=1.0, top_k=10):
-    """
-    Sample SMILES strings from the model without computing gradients.
-    
-    :param model: The GPT model to sample from
-    :param voc: Vocabulary object
-    :param n_mols: Number of molecules (SMILES) to sample
-    :param block_size: Maximum sequence length for sampling
-    :param temperature: Sampling temperature (higher means more random)
-    :param top_k: Number of top tokens to consider for sampling
-    """
-    model.eval()
-    device = next(model.parameters()).device
-
-    with torch.no_grad():
-        codes = torch.full(
-            (n_mols, block_size), fill_value=voc["$"], dtype=torch.long, device=device
+        model.load_state_dict(
+            torch.load(ckpt_load_path, map_location=device), strict=False
         )
-        codes[:, 0] = voc["^"]
-        finished = torch.zeros(n_mols, dtype=torch.bool, device=device)
-
-        for i in range(1, block_size):
-            logits, _, _ = model(codes[:, :i])
-            logits = logits[:, -1, :] / temperature
-
-            if top_k is not None:
-                logits = top_k_logits(logits, k=top_k)
-
-            probs = logits.softmax(dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-            next_token = torch.where(
-                finished, torch.full_like(next_token, voc["$"]), next_token
-            )
-
-            codes[:, i] = next_token
-            finished |= next_token == voc["$"]
-
-            if finished.all():
-                break
-
-    tokenizer = SMILESTokenizer()
-    smiles = []
-    for i in range(n_mols):
-        tokens = voc.decode(codes[i].cpu().numpy())
-        smiles.append(tokenizer.untokenize(tokens))
-
-    return smiles, codes
+    return model, optimizer
 
 
 def _sequence_mask(target, eos_token_id):
@@ -160,13 +119,15 @@ def load_smiles_set(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to TOML config file")
-    
+    parser.add_argument(
+        "--config", type=str, required=True, help="Path to TOML config file"
+    )
+
     args = parser.parse_args()
-    
+
     with open(args.config, "r") as f:
         config = toml.load(f)
-    
+
     model_cfg = config["model"]
     training_cfg = config["training"]
     reward_cfg = config["reward"]
@@ -174,7 +135,7 @@ def main():
     paths_cfg = config["paths"]
     run_cfg = config["run"]
 
-    global_scaffold_memory = {}
+    global_scaffold_memory = OrderedDict()    
     init_rf_model(paths_cfg["rf_model_path"])
     load_ad_nn(paths_cfg["ad_nn_path"])
     train_smiles_set = load_smiles_set(paths_cfg.get("train_smiles_path"))
@@ -198,7 +159,7 @@ def main():
             f"top_k={training_cfg['top_k']}",
             f"n_layer={model_cfg['n_layer']}",
             f"n_head={model_cfg['n_head']}",
-            f"n_embd={model_cfg['n_embd']}"
+            f"n_embd={model_cfg['n_embd']}",
         ]
     )
     writer.add_text("hparams", hparams_text, 0)
@@ -228,7 +189,10 @@ def main():
         )
     ).to(device)
 
-    ref_model.load_state_dict(torch.load(paths_cfg["ckpt_load_path"], map_location=device), strict=False)
+    ref_model.load_state_dict(
+        torch.load(paths_cfg["ckpt_load_path"], map_location=device),
+        strict=False,
+    )
     ref_model.eval()
     replay_buffer = []
 
@@ -246,48 +210,55 @@ def main():
             top_k=training_cfg["top_k"],
         )
 
-        logprobs, _, _ = logprobs_from_codes(model, codes, voc, train_mode=True)
+        logprobs, _, _ = logprobs_from_codes(
+            model, codes, voc, train_mode=True
+        )
 
         with torch.no_grad():
-            logprobs_ref, _, _ = logprobs_from_codes(ref_model, codes, voc, train_mode=False)
+            logprobs_ref, _, _ = logprobs_from_codes(
+                ref_model, codes, voc, train_mode=False
+            )
 
-        processed_data = parallel_process_batch(smiles_list, max_workers=training_cfg["max_workers"])
-        
+        processed_data = parallel_process_batch(
+            smiles_list, max_workers=training_cfg["max_workers"]
+        )
+
         reward = compute_reward(
             processed_data,
             w_rf=reward_cfg["w_rf"],
             w_qed=reward_cfg["w_qed"],
             w_sa=reward_cfg["w_sa"],
         )
-        
+
         filtered_reward = apply_diversity_filter(
-            processed_data, 
-            reward, 
-            global_scaffold_memory, 
-            bucket_size=25 
+            processed_data, reward, global_scaffold_memory, bucket_size=25
         )
-        
-        score = torch.tensor(filtered_reward, dtype=torch.float32, device=device)
-        
+
+        score = torch.tensor(
+            filtered_reward, dtype=torch.float32, device=device
+        )
+
         replay_buffer = update_replay_buffer(
             replay_buffer,
-            smiles_list,  
-            filtered_reward, 
-            logprobs_ref, 
-            buffer_size=100  
+            processed_data,
+            filtered_reward,
+            logprobs_ref,
+            buffer_size=100,
         )
 
         replay_codes, replay_scores, replay_priors = sample_replay_buffer(
-            replay_buffer, 
+            replay_buffer,
             batch_size=max(1, training_cfg["batch_size"] // 10),
-            voc=voc, 
-            device=device, 
-            max_length=model_cfg["max_length"]
+            voc=voc,
+            device=device,
+            max_length=model_cfg["max_length"],
         )
 
         if replay_codes is not None:
-            replay_logprobs, _, _ = logprobs_from_codes(model, replay_codes, voc, train_mode=True)
-            
+            replay_logprobs, _, _ = logprobs_from_codes(
+                model, replay_codes, voc, train_mode=True
+            )
+
             total_logprobs = torch.cat([logprobs, replay_logprobs])
             total_priors = torch.cat([logprobs_ref, replay_priors])
             total_scores = torch.cat([score, replay_scores])
@@ -297,7 +268,9 @@ def main():
             total_scores = score
 
         # REINVENT DAP loss
-        augmented_likelihood = total_priors + (reward_cfg["sigma"] * total_scores)
+        augmented_likelihood = total_priors + (
+            reward_cfg["sigma"] * total_scores
+        )
         loss = 0.5 * ((total_logprobs - augmented_likelihood) ** 2).mean()
         optimizer.zero_grad()
         loss.backward()
@@ -305,7 +278,9 @@ def main():
         optimizer.step()
 
         writer.add_scalar("loss/dap", float(loss.item()), step)
-        writer.add_scalar("reward/mean", float(total_scores.mean().item()), step)
+        writer.add_scalar(
+            "reward/mean", float(total_scores.mean().item()), step
+        )
         writer.add_scalar("reward/max", float(total_scores.max().item()), step)
         writer.add_scalar("reward/min", float(total_scores.min().item()), step)
 
@@ -315,13 +290,17 @@ def main():
 
         if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
             mask = np.array([d["valid"] for d in processed_data], dtype=bool)
-            
-            qed_scores = np.array([d.get("qed", 0.0) for d in processed_data], dtype=np.float32)
-            sa_raw = np.array([d.get("sa", 10.0) for d in processed_data], dtype=np.float32)
-            
+
+            qed_scores = np.array(
+                [d.get("qed", 0.0) for d in processed_data], dtype=np.float32
+            )
+            sa_raw = np.array(
+                [d.get("sa", 10.0) for d in processed_data], dtype=np.float32
+            )
+
             fps = [d["fp"] for d in processed_data]
             std_smiles = [d.get("std_smi", "") for d in processed_data]
-            
+
             rf_probs = predict_activity_proba(fps)
             ad_dists = ad_domain_score(std_smiles, fps=fps)
 
@@ -339,7 +318,9 @@ def main():
             if sa_valid.size > 0:
                 writer.add_histogram("sa/score_dist", sa_valid, step)
 
-            sampled_smiles, _, _ = sample_SMILES(model, voc=voc, n_mols=100, block_size=200, top_k=10)
+            sampled_smiles, _ = sample_smiles_nograd(
+                model, voc=voc, n_mols=100, block_size=200, top_k=10
+            )
             validity = model_validity(sampled_smiles)
             uniqueness = model_uniqueness(sampled_smiles)
             diversity = model_diversity(sampled_smiles)
@@ -356,9 +337,13 @@ def main():
                 k = min(8, len(valid_mols))
                 idx = np.random.choice(len(valid_mols), size=k, replace=False)
                 mols_subset = [valid_mols[i] for i in idx]
-                img = Draw.MolsToGridImage(mols_subset, molsPerRow=4, subImgSize=(200, 200))
+                img = Draw.MolsToGridImage(
+                    mols_subset, molsPerRow=4, subImgSize=(200, 200)
+                )
                 img_np = np.array(img)
-                writer.add_image("samples/molecules", img_np, step, dataformats="HWC")
+                writer.add_image(
+                    "samples/molecules", img_np, step, dataformats="HWC"
+                )
 
 
 if __name__ == "__main__":

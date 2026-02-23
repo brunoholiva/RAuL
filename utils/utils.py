@@ -1,159 +1,218 @@
+"""
+Utility functions for SMILES generation, sampling, and reward transformations.Base code used from ACARL
+"""
+
 import random
+from typing import Any, List, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from rdkit import Chem
-from rdkit.Chem import AllChem, Draw
-from tdc import Evaluator
-from tqdm import tqdm
-from pretraining.vocabulary import SMILESTokenizer
 
-def randomize_smiles(smiles):
-    # randomize SMILES for data augmentation
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return smiles
-    ans = list(range(mol.GetNumAtoms()))
-    if not ans:
-        return smiles
-    np.random.shuffle(ans)
-    new_mol = Chem.RenumberAtoms(mol, ans)
-    return Chem.MolToSmiles(new_mol, canonical=False)
-
-# @torch.no_grad()
-def likelihood(model, seqs):
-    nll_loss = nn.NLLLoss(reduction="none")
-    seqs = seqs.cuda()
-    logits, _, _ = model(seqs[:, :-1])
-    log_probs = logits.log_softmax(dim=2)
-    return nll_loss(log_probs.transpose(1, 2), seqs[:, 1:]).sum(dim=1)
+from pretraining.vocabulary import SMILESTokenizer, Vocabulary
 
 
-@torch.no_grad()
-def sample_SMILES(model, voc, n_mols=100, block_size=200, temperature=1.0, top_k=10):
+def sample_smiles_nograd(
+    model: nn.Module,
+    voc: Vocabulary,
+    n_mols: int,
+    block_size: int,
+    temperature: float = 1.0,
+    top_k: int = 10,
+) -> Tuple[List[str], torch.Tensor]:
     """
-    take a conditioning sequence of indices in x (of shape (b,t)) and predict the next token in
-    the sequence, feeding the predictions back into the model each time. Clearly the sampling
-    has quadratic complexity unlike an RNN that is only linear, and has a finite context window
-    of block_size, unlike an RNN that has an infinite context window.
-    """
-    nll_loss = nn.NLLLoss(reduction="none")
-    codes = torch.zeros((n_mols, 1), dtype=torch.long).to("cuda")
-    codes[:] = voc["^"]
-    nlls = torch.zeros(n_mols).to("cuda")
+    Sample SMILES strings from a trained model without tracking gradients.
 
+    This function generates SMILES strings autoregressively by sampling tokens
+    from the model's output distribution. It uses temperature scaling and top-k
+    filtering to control the randomness of sampling. The generation stops when
+    all sequences reach the end-of-sequence token ('$') or hit the block_size limit.
+
+    Parameters:
+    -----------
+    model: nn.Module
+        The trained PyTorch model for SMILES generation (e.g., GPT).
+    voc: Vocabulary
+        The vocabulary object containing token-to-index mappings and decode methods.
+    n_mols: int
+        The number of SMILES strings to generate.
+    block_size: int
+        The maximum length of the generated SMILES strings (including start/end tokens).
+    temperature: float, default=1.0
+        The temperature for sampling. Higher values (>1.0) lead to more random samples,
+        lower values (<1.0) make the distribution sharper and more deterministic.
+    top_k: int, default=10
+        The number of top tokens to consider for sampling at each step. Limits the
+        sampling pool to the k most likely tokens.
+
+    Returns:
+    --------
+    Tuple[List[str], torch.Tensor]
+        A tuple containing:
+        - smiles (List[str]): List of generated SMILES strings (untokenized).
+        - codes (torch.Tensor): Tensor of shape (n_mols, block_size) containing
+          the token indices for all generated sequences.
+    """
     model.eval()
-    for k in range(block_size - 1):
-        logits, _, _ = model(codes)  
-        # pluck the logits at the final step and scale by temperature
-        logits = logits[:, -1, :] / temperature
-        # # optionally crop probabilities to only the top k options
-        if top_k is not None:
-            logits = top_k_logits(logits, k=top_k)
-        # apply softmax to convert to probabilities
-        probs = logits.softmax(dim=-1)
-        log_probs = logits.log_softmax(dim=1)
-        # sample from the distribution
-        code_i = torch.multinomial(probs, num_samples=1)
-        # print(probs)
-        # append to the sequence and continue
-        codes = torch.cat((codes, code_i), dim=1)
+    device = next(model.parameters()).device
 
-        nlls += nll_loss(log_probs, code_i.view(-1))
-        if code_i.sum() == 0:
-            break
+    with torch.no_grad():
+        codes = torch.full(
+            (n_mols, block_size),
+            fill_value=voc["$"],
+            dtype=torch.long,
+            device=device,
+        )
+        codes[:, 0] = voc["^"]
+        finished = torch.zeros(n_mols, dtype=torch.bool, device=device)
 
-    # codes = codes
+        for i in range(1, block_size):
+            logits, _, _ = model(codes[:, :i])
+            logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                logits = top_k_logits(logits, k=top_k)
+
+            probs = logits.softmax(dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+            next_token = torch.where(
+                finished, torch.full_like(next_token, voc["$"]), next_token
+            )
+
+            codes[:, i] = next_token
+            finished |= next_token == voc["$"]
+
+            if finished.all():
+                break
+
+    tokenizer = SMILESTokenizer()
     smiles = []
-    Tokenizer = SMILESTokenizer()
     for i in range(n_mols):
-        tokens_i = voc.decode(np.array(codes[i, :].cpu()))
-        smiles_i = Tokenizer.untokenize(tokens_i)
-        smiles.append(smiles_i)
+        tokens = voc.decode(codes[i].cpu().numpy())
+        smiles.append(tokenizer.untokenize(tokens))
 
-    return smiles, codes, nlls
+    return smiles, codes
 
 
-def calc_fingerprints(smiles):
-    mols = [Chem.MolFromSmiles(s) for s in smiles]
-    fps = [AllChem.GetMorganFingerprintAsBitVect(x, radius = 2, nBits = 2048) for x in mols]
-    smiles_canonicalized = [Chem.MolToSmiles(x, isomericSmiles=False) for x in mols]
-    return fps, smiles_canonicalized
+def set_seed(seed: int) -> None:
+    """
+    Set random seeds for reproducibility across numpy, random, and PyTorch.
 
-def set_seed(seed):
+    Parameters:
+    -----------
+    seed: int
+        The random seed value.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def top_k_logits(logits, k):
+
+def top_k_logits(logits: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Mask logits so that only the top k tokens have non-negative infinity values.
+
+    Parameters:
+    -----------
+    logits: torch.Tensor
+        The raw logits from the model.
+    k: int
+        The number of top tokens to keep.
+
+    Returns:
+    --------
+    torch.Tensor
+        The masked logits.
+    """
     v, ix = torch.topk(logits, k)
-    out = torch.full_like(logits, float('-inf'))
+    out = torch.full_like(logits, float("-inf"))
     out.scatter_(dim=-1, index=ix, src=v)
     return out
 
-def to_tensor(tensor):
-    if isinstance(tensor, np.ndarray):
-        tensor = torch.from_numpy(tensor)
-    if torch.cuda.is_available():
-        return torch.autograd.Variable(tensor).cuda()
-    return torch.autograd.Variable(tensor)
 
-
-
-# testing metrics
-from rdkit.DataStructs import FingerprintSimilarity
-
-def model_uniqueness(smiles_list):
-    valid_smiles = [s for s in smiles_list if Chem.MolFromSmiles(s) is not None]
-    unique_smiles = set(valid_smiles)
-    return len(unique_smiles) / max(1, len(valid_smiles))
-
-def model_novelty(smiles_list, train_smiles_set):
-    valid_smiles = [s for s in smiles_list if Chem.MolFromSmiles(s) is not None]
-    unique_smiles = set(valid_smiles)
-    novel_smiles = [s for s in unique_smiles if s not in train_smiles_set]
-    return len(novel_smiles) / max(1, len(unique_smiles))
-
-def model_diversity(smiles_list):
-    valid_smiles = [s for s in smiles_list if Chem.MolFromSmiles(s) is not None]
-    fps, _ = calc_fingerprints(valid_smiles)
-    n = len(fps)
-    if n < 2:
-        return 0.0
-    sims = []
-    for i in range(n):
-        for j in range(i+1, n):
-            sims.append(FingerprintSimilarity(fps[i], fps[j]))
-    avg_diversity = 1 - np.mean(sims)
-    return avg_diversity
-
-
-def model_validity(smiles_list):
-    evaluator = Evaluator(name = 'Validity')
-    return evaluator(smiles_list)
-   
-def reverse_sigmoid(value, low, high, k=0.25):
+def to_tensor(data: Any, device: torch.device) -> torch.Tensor:
     """
+    Convert data (numpy array or list) to a PyTorch tensor on a specific device.
+
+    Parameters:
+    -----------
+    data: Any
+        The input data to convert (e.g., numpy array, list).
+    device: torch.device
+        The device to place the tensor on.
+
+    Returns:
+    --------
+    torch.Tensor
+        The resulting PyTorch tensor.
+    """
+    return torch.as_tensor(data, device=device)
+
+
+def reverse_sigmoid(
+    value: float, low: float, high: float, k: float = 0.25
+) -> float:
+    """
+    Apply a reverse sigmoid transformation.
+
     High values are BAD (0.0), Low values are GOOD (1.0).
     Example: Penalizing Molecular Weight.
+
+    Parameters:
+    -----------
+    value: float
+        The raw value to be transformed.
+    low: float
+        The lower bound of the transformation window.
+    high: float
+        The upper bound of the transformation window.
+    k: float, default=0.25
+        The slope of the sigmoid curve.
+
+    Returns:
+    --------
+    float
+        The transformed score between 0.0 and 1.0.
     """
-    if value < low: return 1.0
-    if value > high: return 0.0
-    return 1.0 / (1.0 + 10.0 ** (k * (value - (high + low) / 2) / (high - low))) # from reinvent
+    if value < low:
+        return 1.0
+    if value > high:
+        return 0.0
+
+    exponent = k * (value - (high + low) / 2) / (high - low)
+    return 1.0 / (1.0 + 10.0**exponent)
 
 
-def sigmoid(value, low, high, k=0.25):
+def sigmoid(value: float, low: float, high: float, k: float = 0.25) -> float:
     """
+    Apply a standard sigmoid transformation.
+
     High values are GOOD (1.0), Low values are BAD (0.0).
     Example: QED or Activity Probability.
+
+    Parameters:
+    -----------
+    value: float
+        The raw value to be transformed.
+    low: float
+        The lower bound of the transformation window.
+    high: float
+        The upper bound of the transformation window.
+    k: float, default=0.25
+        The slope of the sigmoid curve.
+
+    Returns:
+    --------
+    float
+        The transformed score between 0.0 and 1.0.
     """
-    if value < low: return 0.0
-    if value > high: return 1.0
-    return 1.0 / (1.0 + 10.0 ** (k * ((high + low) / 2 - value) / (high - low)))
+    if value < low:
+        return 0.0
+    if value > high:
+        return 1.0
 
-
-def step_function(value, min_val):
-    """Hard cutoff. Below min_val is 0, above is 1."""
-    return 1.0 if value >= min_val else 0.0
+    exponent = k * ((high + low) / 2 - value) / (high - low)
+    return 1.0 / (1.0 + 10.0**exponent)
