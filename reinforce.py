@@ -10,9 +10,9 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from pretraining.model import GPT, GPTConfig
-from pretraining.vocabulary import SMILESTokenizer, read_vocabulary
+from pretraining.vocabulary import read_vocabulary
 from scoring.activity import init_rf_model, predict_activity_proba
-from scoring.molecular import ad_domain_score, load_ad_nn
+from scoring.molecular import ad_domain_score, load_ad_model
 from scoring.reward import (
     apply_diversity_filter,
     compute_reward,
@@ -118,6 +118,8 @@ def load_smiles_set(path):
 
 
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", type=str, required=True, help="Path to TOML config file"
@@ -137,7 +139,7 @@ def main():
 
     global_scaffold_memory = OrderedDict()    
     init_rf_model(paths_cfg["rf_model_path"])
-    load_ad_nn(paths_cfg["ad_nn_path"])
+    ad_model = load_ad_model(path=paths_cfg["ad_nn_path"], device=device)
     train_smiles_set = load_smiles_set(paths_cfg.get("train_smiles_path"))
 
     writer = SummaryWriter("runs/logging/" + run_cfg["run_name"])
@@ -166,7 +168,6 @@ def main():
 
     set_seed(42)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     voc = read_vocabulary(paths_cfg["vocab_path"])
     model, optimizer = create_model(
         voc=voc,
@@ -225,6 +226,7 @@ def main():
 
         reward = compute_reward(
             processed_data,
+            ad_model,
             w_rf=reward_cfg["w_rf"],
             w_qed=reward_cfg["w_qed"],
             w_sa=reward_cfg["w_sa"],
@@ -302,7 +304,7 @@ def main():
             std_smiles = [d.get("std_smi", "") for d in processed_data]
 
             rf_probs = predict_activity_proba(fps)
-            ad_dists = ad_domain_score(std_smiles, fps=fps)
+            ad_dists = ad_domain_score(fps, ad_model=ad_model)
 
             rf_valid = rf_probs[mask]
             ad_valid = ad_dists[mask]

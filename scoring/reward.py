@@ -91,9 +91,27 @@ def parallel_process_batch(smiles_list, max_workers=None):
     return results
 
 
-def compute_reward(processed_data, w_rf=3.0, w_qed=1.0, w_sa=1.0):
+def compute_reward(processed_data, ad_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
     """
     Calculates rewards using the pre-computed data from the parallel workers.
+
+    Parameters
+    ----------
+    processed_data : List[Dict[str, Any]]
+        The list of dictionaries pre-computed by parallel_process_batch.
+    ad_model : Dict[str, Any]
+        The dictionary containing the loaded AD model and tensors.
+    w_rf : float, optional
+        The weight for the random forest activity score (default is 3.0).
+    w_qed : float, optional
+        The weight for the QED score (default is 1.0).
+    w_sa : float, optional
+        The weight for the SA score (default is 1.0).
+    
+    Returns
+    -------
+    List[float]
+        The list of reward scores for each molecule in processed_data.
     """
 
     valid_mask = np.array(
@@ -116,7 +134,7 @@ def compute_reward(processed_data, w_rf=3.0, w_qed=1.0, w_sa=1.0):
     )
 
     rf_probs = predict_activity_proba(fps)
-    ad_dists = ad_domain_score(std_smiles, fps=fps)
+    ad_dists = ad_domain_score(fps=fps,ad_model=ad_model)
 
     score_rf = np.array(
         [sigmoid(v, low=0.5, high=0.85) for v in rf_probs], dtype=np.float32
