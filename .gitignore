@@ -11,4 +11,4 @@ checkpoints/
 /data/predictor/*.joblib
 *.txt
 *ipynb
-.vscode/
+.vscode
