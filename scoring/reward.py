@@ -90,7 +90,9 @@ def parallel_process_batch(smiles_list, max_workers=None):
     return results
 
 
-def compute_reward(processed_data, ad_model, rf_model, w_rf=3.0, w_qed=1.0, w_sa=1.0):
+def compute_reward(
+    processed_data, ad_model, rf_model, w_rf=3.0, w_qed=1.0, w_sa=1.0
+):
     """
     Calculates rewards using the pre-computed data from the parallel workers.
 
@@ -135,11 +137,14 @@ def compute_reward(processed_data, ad_model, rf_model, w_rf=3.0, w_qed=1.0, w_sa
     )
 
     rf_probs = predict_activity_proba(fps, rf_model=rf_model)
+    rf_probs_clipped = np.clip(rf_probs, 0.0, 0.7)
     ad_dists = ad_domain_score(fps=fps, ad_model=ad_model)
 
     score_rf = np.array(
-        [sigmoid(v, low=0.5, high=0.85) for v in rf_probs], dtype=np.float32
+        [sigmoid(v, low=0.5, high=0.7) for v in rf_probs_clipped],
+        dtype=np.float32,
     )
+
     score_ad_trust = np.array(
         [reverse_sigmoid(v, low=0.5, high=0.7) for v in ad_dists],
         dtype=np.float32,
