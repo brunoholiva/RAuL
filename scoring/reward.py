@@ -37,7 +37,7 @@ def process_single_molecule(smi: str) -> Dict[str, Any]:
         "fp": None,
         "scaffold": None,
         "scaffold_smi": None,
-        "scaffold_fp": None,  # This will now safely hold an ExplicitBitVect
+        "scaffold_fp": None,
         "pains_ok": 0.0,
     }
 
@@ -54,7 +54,6 @@ def process_single_molecule(smi: str) -> Dict[str, Any]:
     scaffold_mol = get_scaffold(mol)
     scaffold_smi = Chem.MolToSmiles(scaffold_mol) if scaffold_mol else None
 
-    # Generate pure C++ ExplicitBitVect for the diversity filter
     scaffold_fp = (
         AllChem.GetMorganFingerprintAsBitVect(
             scaffold_mol, radius=2, nBits=2048
@@ -71,7 +70,7 @@ def process_single_molecule(smi: str) -> Dict[str, Any]:
         "qed": qed_score(mol=mol),
         "sa": sa_score(mol=mol),
         "mw": Descriptors.MolWt(mol),
-        "fp": mol_to_fp(mol),  # Keep numpy array for the ML models
+        "fp": mol_to_fp(mol),  
         "scaffold": scaffold_smi,
         "scaffold_smi": scaffold_smi,
         "scaffold_fp": scaffold_fp,
@@ -141,7 +140,7 @@ def compute_reward(
     ad_dists = ad_domain_score(fps=fps, ad_model=ad_model)
 
     score_rf = np.array(
-        [sigmoid(v, low=0.5, high=0.7) for v in rf_probs_clipped],
+        [sigmoid(v, low=0.6, high=0.85) for v in rf_probs_clipped],
         dtype=np.float32,
     )
 
@@ -161,14 +160,14 @@ def compute_reward(
         dtype=np.float32,
     )
 
-    term_rf = w_rf * (score_rf * score_ad_trust)
+    term_rf = w_rf * score_rf
     term_qed = w_qed * score_qed
     term_sa = w_sa * score_sa
 
-    raw_total_reward = term_rf + term_qed + term_sa
+    raw_total_reward = term_rf + term_qed + term_sa + score_ad_trust
     total_reward = (
         raw_total_reward * score_mw
-    )  # Penalize if MW is out of range
+    )  
 
     # Zero out invalid molecules
     final_rewards = total_reward * valid_mask
@@ -280,20 +279,22 @@ def apply_diversity_filter(
 
 
 def update_replay_buffer(
-    buffer: List[Tuple[float, str, float, Optional[str]]],
+    buffer: List[Tuple[float, str, float, Optional[Any]]],
     processed_data: List[Dict[str, Any]],
     scores: torch.Tensor,
     prior_logprobs: torch.Tensor,
     buffer_size: int = 100,
     max_per_scaffold: int = 3,
-) -> List[Tuple[float, str, float, Optional[str]]]:
+    similarity_threshold: float = 0.65,
+) -> List[Tuple[float, str, float, Optional[Any]]]:
     """
-    Updates the buffer with new experience, enforcing scaffold diversity.
+    Updates the buffer with new experience, enforcing scaffold diversity
+    via Tanimoto similarity of scaffold fingerprints.
 
     Parameters
     ----------
-    buffer : List[Tuple[float, str, float, Optional[str]]]
-        The current replay buffer containing (score, smi, prior_logprob, scaffold_smi).
+    buffer : List[Tuple[float, str, float, Optional[Any]]]
+        The current replay buffer containing (score, smi, prior, scaffold_fp).
     processed_data : List[Dict[str, Any]]
         The list of dictionaries pre-computed by parallel_process_batch.
     scores : torch.Tensor
@@ -303,11 +304,14 @@ def update_replay_buffer(
     buffer_size : int, optional
         Maximum number of items to keep in the buffer (default is 100).
     max_per_scaffold : int, optional
-        Maximum allowed molecules per unique scaffold (default is 3).
+        Maximum allowed molecules with a similar scaffold (default is 3).
+    similarity_threshold : float, optional
+        The Tanimoto threshold above which two scaffolds are considered
+        the "same" (default is 0.65).
 
     Returns
     -------
-    List[Tuple[float, str, float, Optional[str]]]
+    List[Tuple[float, str, float, Optional[Any]]]
         The updated, sorted, and filtered replay buffer.
     """
     new_items = []
@@ -321,7 +325,7 @@ def update_replay_buffer(
                     score_val,
                     data["smi"],
                     float(plp.item()),
-                    data.get("scaffold_smi"),
+                    data.get("scaffold_fp"),  
                 )
             )
 
@@ -329,16 +333,27 @@ def update_replay_buffer(
     combined.sort(key=lambda x: x[0], reverse=True)
 
     diverse_buffer = []
-    scaffold_counts: Dict[str, int] = {}
+    diverse_fps = []  
 
     for item in combined:
-        score, smi, prior, scaffold = item
+        score, smi, prior, scaffold_fp = item
 
-        if scaffold:
-            count = scaffold_counts.get(scaffold, 0)
-            if count < max_per_scaffold:
+        if scaffold_fp is not None:
+            if diverse_fps:
+                sims = DataStructs.BulkTanimotoSimilarity(
+                    scaffold_fp, diverse_fps
+                )
+                
+                similar_count = sum(
+                    1 for sim in sims if sim >= similarity_threshold
+                )
+
+                if similar_count < max_per_scaffold:
+                    diverse_buffer.append(item)
+                    diverse_fps.append(scaffold_fp)
+            else:
                 diverse_buffer.append(item)
-                scaffold_counts[scaffold] = count + 1
+                diverse_fps.append(scaffold_fp)
         else:
             diverse_buffer.append(item)
 
