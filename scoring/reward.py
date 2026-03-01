@@ -70,7 +70,7 @@ def process_single_molecule(smi: str) -> Dict[str, Any]:
         "qed": qed_score(mol=mol),
         "sa": sa_score(mol=mol),
         "mw": Descriptors.MolWt(mol),
-        "fp": mol_to_fp(mol),  
+        "fp": mol_to_fp(mol),
         "scaffold": scaffold_smi,
         "scaffold_smi": scaffold_smi,
         "scaffold_fp": scaffold_fp,
@@ -89,91 +89,102 @@ def parallel_process_batch(smiles_list, max_workers=None):
     return results
 
 
-def compute_reward(
-    processed_data, ad_model, rf_model, w_rf=3.0, w_qed=1.0, w_sa=1.0
-):
+def make_rf_scorer(rf_model, weight: float):
+    def scorer(processed_data) -> np.ndarray:
+        fps = [d["fp"] for d in processed_data]
+        rf_probs = predict_activity_proba(fps, rf_model=rf_model)
+        rf_probs_clipped = np.clip(rf_probs, 0.0, 0.7)
+        return weight * np.array(
+            [sigmoid(v, low=0.6, high=0.85) for v in rf_probs_clipped],
+            dtype=np.float32,
+        )
+
+    return scorer
+
+
+def make_ad_scorer(ad_model, weight: float = 1.0):
+    def scorer(processed_data) -> np.ndarray:
+        fps = [d["fp"] for d in processed_data]
+        ad_dists = ad_domain_score(fps=fps, ad_model=ad_model)
+        return weight * np.array(
+            [reverse_sigmoid(v, low=0.5, high=0.7) for v in ad_dists],
+            dtype=np.float32,
+        )
+
+    return scorer
+
+
+def make_qed_scorer(weight: float):
+    def scorer(processed_data) -> np.ndarray:
+        qed_vals = np.array(
+            [d.get("qed", 0.0) for d in processed_data], dtype=np.float32
+        )
+        return weight * np.array(
+            [sigmoid(v, low=0.4, high=0.8) for v in qed_vals], dtype=np.float32
+        )
+
+    return scorer
+
+
+def make_sa_scorer(weight: float):
+    def scorer(processed_data) -> np.ndarray:
+        sa_vals = np.array(
+            [d.get("sa", 10.0) for d in processed_data], dtype=np.float32
+        )
+        return weight * np.array(
+            [reverse_sigmoid(v, low=3.0, high=6.0) for v in sa_vals],
+            dtype=np.float32,
+        )
+
+    return scorer
+
+
+def make_mw_penalty():
+    def scorer(processed_data) -> np.ndarray:
+        mw_weights = np.array(
+            [d.get("mw", 600.0) for d in processed_data], dtype=np.float32
+        )
+        return np.array(
+            [reverse_sigmoid(v, low=500, high=600) for v in mw_weights],
+            dtype=np.float32,
+        )
+
+    return scorer
+
+
+def make_valid_mask():
+    def scorer(processed_data) -> np.ndarray:
+        return np.array(
+            [1.0 if d["valid"] else 0.0 for d in processed_data],
+            dtype=np.float32,
+        )
+
+    return scorer
+
+
+def make_pains_filter():
+    def scorer(processed_data) -> np.ndarray:
+        return np.array(
+            [d.get("pains_ok", 1.0) for d in processed_data], dtype=np.float32
+        )
+
+    return scorer
+
+
+def compute_reward(processed_data, additive_scorers, multiplier_scorers):
     """
-    Calculates rewards using the pre-computed data from the parallel workers.
-
-    Parameters
-    ----------
-    processed_data : List[Dict[str, Any]]
-        The list of dictionaries pre-computed by parallel_process_batch.
-    ad_model : Dict[str, Any]
-        The dictionary containing the loaded AD model and tensors.
-    rf_model : Any
-        The loaded random forest model.
-    w_rf : float, optional
-        The weight for the random forest activity score (default is 3.0).
-    w_qed : float, optional
-        The weight for the QED score (default is 1.0).
-    w_sa : float, optional
-        The weight for the SA score (default is 1.0).
-
-    Returns
-    -------
-    List[float]
-        The list of reward scores for each molecule in processed_data.
+    Calculates rewards using pre-configured scoring functions.
     """
+    batch_size = len(processed_data)
+    total_reward = np.zeros(batch_size, dtype=np.float32)
 
-    valid_mask = np.array(
-        [1.0 if d["valid"] else 0.0 for d in processed_data], dtype=np.float32
-    )
-    fps = [d["fp"] for d in processed_data]
-    std_smiles = [d["std_smi"] if d["valid"] else "" for d in processed_data]
+    for scorer in additive_scorers:
+        total_reward += scorer(processed_data)
 
-    qed_vals = np.array(
-        [d.get("qed", 0.0) for d in processed_data], dtype=np.float32
-    )
-    sa_vals = np.array(
-        [d.get("sa", 10.0) for d in processed_data], dtype=np.float32
-    )
-    mw_weights = np.array(
-        [d.get("mw", 600.0) for d in processed_data], dtype=np.float32
-    )
-    pains_ok = np.array(
-        [d.get("pains_ok", 1.0) for d in processed_data], dtype=np.float32
-    )
+    for multiplier in multiplier_scorers:
+        total_reward *= multiplier(processed_data)
 
-    rf_probs = predict_activity_proba(fps, rf_model=rf_model)
-    rf_probs_clipped = np.clip(rf_probs, 0.0, 0.7)
-    ad_dists = ad_domain_score(fps=fps, ad_model=ad_model)
-
-    score_rf = np.array(
-        [sigmoid(v, low=0.6, high=0.85) for v in rf_probs_clipped],
-        dtype=np.float32,
-    )
-
-    score_ad_trust = np.array(
-        [reverse_sigmoid(v, low=0.5, high=0.7) for v in ad_dists],
-        dtype=np.float32,
-    )
-    score_qed = np.array(
-        [sigmoid(v, low=0.4, high=0.8) for v in qed_vals], dtype=np.float32
-    )
-    score_sa = np.array(
-        [reverse_sigmoid(v, low=3.0, high=6.0) for v in sa_vals],
-        dtype=np.float32,
-    )
-    score_mw = np.array(
-        [reverse_sigmoid(v, low=500, high=600) for v in mw_weights],
-        dtype=np.float32,
-    )
-
-    term_rf = w_rf * score_rf
-    term_qed = w_qed * score_qed
-    term_sa = w_sa * score_sa
-
-    raw_total_reward = term_rf + term_qed + term_sa + score_ad_trust
-    total_reward = (
-        raw_total_reward * score_mw
-    )  
-
-    # Zero out invalid molecules
-    final_rewards = total_reward * valid_mask
-
-    final_rewards = final_rewards * pains_ok
-    return final_rewards
+    return total_reward
 
 
 def apply_diversity_filter(
@@ -325,7 +336,7 @@ def update_replay_buffer(
                     score_val,
                     data["smi"],
                     float(plp.item()),
-                    data.get("scaffold_fp"),  
+                    data.get("scaffold_fp"),
                 )
             )
 
@@ -333,7 +344,7 @@ def update_replay_buffer(
     combined.sort(key=lambda x: x[0], reverse=True)
 
     diverse_buffer = []
-    diverse_fps = []  
+    diverse_fps = []
 
     for item in combined:
         score, smi, prior, scaffold_fp = item
@@ -343,7 +354,7 @@ def update_replay_buffer(
                 sims = DataStructs.BulkTanimotoSimilarity(
                     scaffold_fp, diverse_fps
                 )
-                
+
                 similar_count = sum(
                     1 for sim in sims if sim >= similarity_threshold
                 )

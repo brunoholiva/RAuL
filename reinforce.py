@@ -1,7 +1,8 @@
 import argparse
-from typing import Any, Optional, Set, Tuple
 import os
 from collections import OrderedDict
+from typing import Any, Optional, Set, Tuple
+
 import numpy as np
 import toml
 import torch
@@ -21,13 +22,13 @@ from scoring.reward import (
     sample_replay_buffer,
     update_replay_buffer,
 )
-from utils.utils import set_seed, sample_smiles_nograd
 from utils.rdkit_utils import (
     model_diversity,
     model_novelty,
     model_uniqueness,
-    model_validity
+    model_validity,
 )
+from utils.utils import sample_smiles_nograd, set_seed
 
 
 def create_model(
@@ -39,7 +40,7 @@ def create_model(
     learning_rate: float,
     device: str,
     ckpt_load_path: Optional[str] = None,
-)-> Tuple[GPT, torch.optim.Optimizer]:
+) -> Tuple[GPT, torch.optim.Optimizer]:
     """
     Creates the GPT model and optimizer.
 
@@ -61,7 +62,7 @@ def create_model(
         The device to run the model on (e.g., "cuda" or "cpu").
     ckpt_load_path : Optional[str], optional
         The path to a checkpoint to load model weights from (default is None).
-    
+
     Returns
     -------
     Tuple[GPT, torch.optim.Optimizer]
@@ -86,9 +87,7 @@ def create_model(
     return model, optimizer
 
 
-def _sequence_mask(
-    target: torch.Tensor, eos_token_id: int
-) -> torch.Tensor:
+def _sequence_mask(target: torch.Tensor, eos_token_id: int) -> torch.Tensor:
     """
     Create a binary mask identifying valid tokens before the EOS token.
 
@@ -160,7 +159,10 @@ def _sequence_entropy(
 
 
 def logprobs_from_codes(
-    model: torch.nn.Module, codes: torch.Tensor, voc: Any, train_mode: bool = True
+    model: torch.nn.Module,
+    codes: torch.Tensor,
+    voc: Any,
+    train_mode: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute log probabilities and entropy for a batch of token codes.
@@ -221,7 +223,7 @@ def load_smiles_set(path: Optional[str]) -> Optional[Set[str]]:
     return smiles_set
 
 
-def main()-> None: 
+def main() -> None:
     """
     Main training loop for the RAuL reinforcement learning pipeline.
     """
@@ -244,7 +246,7 @@ def main()-> None:
     paths_cfg = config["paths"]
     run_cfg = config["run"]
 
-    global_scaffold_memory = OrderedDict()    
+    global_scaffold_memory = OrderedDict()
     rf_model = load_rf_model(paths_cfg["rf_model_path"])
     ad_model = load_ad_model(path=paths_cfg["ad_nn_path"], device=device)
     train_smiles_set = load_smiles_set(paths_cfg.get("train_smiles_path"))
@@ -304,6 +306,29 @@ def main()-> None:
     ref_model.eval()
     replay_buffer = []
 
+    from scoring.reward import (
+        make_ad_scorer,
+        make_mw_penalty,
+        make_pains_filter,
+        make_qed_scorer,
+        make_rf_scorer,
+        make_sa_scorer,
+        make_valid_mask,
+    )
+
+    active_additive_scorers = [
+        make_rf_scorer(rf_model, weight=reward_cfg["w_rf"]),
+        make_ad_scorer(ad_model, weight=1.0),
+        make_qed_scorer(weight=reward_cfg["w_qed"]),
+        make_sa_scorer(weight=reward_cfg["w_sa"]),
+    ]
+
+    active_multiplier_scorers = [
+        make_mw_penalty(),
+        make_valid_mask(),
+        make_pains_filter(),
+    ]
+
     for p in ref_model.parameters():
         p.requires_grad = False
 
@@ -333,11 +358,8 @@ def main()-> None:
 
         reward = compute_reward(
             processed_data,
-            ad_model=ad_model,
-            rf_model=rf_model,
-            w_rf=reward_cfg["w_rf"],
-            w_qed=reward_cfg["w_qed"],
-            w_sa=reward_cfg["w_sa"],
+            additive_scorers=active_additive_scorers,
+            multiplier_scorers=active_multiplier_scorers,
         )
 
         filtered_reward = apply_diversity_filter(
