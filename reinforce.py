@@ -3,11 +3,11 @@ import os
 from collections import OrderedDict
 from typing import Any, Optional, Set, Tuple
 
-import toml
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from config import ExperimentConfig, ModelConfig, PathsConfig, TrainingConfig
 from pretraining.model import GPT, GPTConfig
 from pretraining.vocabulary import read_vocabulary
 from scoring.activity import load_rf_model
@@ -31,13 +31,10 @@ from utils.utils import sample_smiles_nograd, set_seed
 
 def create_model(
     voc: Any,
-    n_layer: int,
-    n_head: int,
-    n_embd: int,
-    max_length: int,
-    learning_rate: float,
+    model_cfg: ModelConfig,
+    training_cfg: TrainingConfig,
+    paths_cfg: PathsConfig,
     device: str,
-    ckpt_load_path: Optional[str] = None,
 ) -> Tuple[GPT, torch.optim.Optimizer]:
     """
     Creates the GPT model and optimizer.
@@ -46,20 +43,15 @@ def create_model(
     ----------
     voc : Any
         The vocabulary object containing token mappings.
-    n_layer : int
-        The number of transformer layers.
-    n_head : int
-        The number of attention heads.
-    n_embd : int
-        The embedding dimension.
-    max_length : int
-        The maximum sequence length (block size).
-    learning_rate : float
-        The learning rate for the optimizer.
+    model_cfg : ModelConfig
+        The model configuration object.
+    training_cfg : TrainingConfig
+        The training configuration object.
+    paths_cfg : PathsConfig
+        The paths configuration object.
     device : str
         The device to run the model on (e.g., "cuda" or "cpu").
-    ckpt_load_path : Optional[str], optional
-        The path to a checkpoint to load model weights from (default is None).
+
 
     Returns
     -------
@@ -68,19 +60,22 @@ def create_model(
     """
     model_config = GPTConfig(
         voc.__len__(),
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        block_size=max_length,
+        n_layer=model_cfg.n_layer,
+        n_head=model_cfg.n_head,
+        n_embd=model_cfg.n_embd,
+        block_size=model_cfg.max_length,
     )
     model = GPT(model_config).to(device)
     optimizer = model.configure_optimizers(
-        weight_decay=0.1, learning_rate=learning_rate, betas=(0.9, 0.95)
+        weight_decay=0.1,
+        learning_rate=training_cfg.learning_rate,
+        betas=(0.9, 0.95),
     )
-    if ckpt_load_path is not None:
-        print(f"Loading checkpoint from {ckpt_load_path}")
+    if paths_cfg.ckpt_load_path is not None:
+        print(f"Loading checkpoint from {paths_cfg.ckpt_load_path}")
         model.load_state_dict(
-            torch.load(ckpt_load_path, map_location=device), strict=False
+            torch.load(paths_cfg.ckpt_load_path, map_location=device),
+            strict=False,
         )
     return model, optimizer
 
@@ -234,80 +229,68 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    with open(args.config, "r") as f:
-        config = toml.load(f)
-
-    model_cfg = config["model"]
-    training_cfg = config["training"]
-    reward_cfg = config["reward"]
-    eval_cfg = config["evaluation"]
-    paths_cfg = config["paths"]
-    run_cfg = config["run"]
+    cfg = ExperimentConfig.from_toml(args.config)
 
     global_scaffold_memory = OrderedDict()
-    rf_model = load_rf_model(paths_cfg["rf_model_path"])
-    ad_model = load_ad_model(path=paths_cfg["ad_nn_path"], device=device)
-    train_smiles_set = load_smiles_set(paths_cfg.get("train_smiles_path"))
+    rf_model = load_rf_model(path=cfg.paths.rf_model_path)
+    ad_model = load_ad_model(path=cfg.paths.ad_nn_path, device=device)
+    train_smiles_set = load_smiles_set(path=cfg.paths.train_smiles_path)
 
-    writer = SummaryWriter("runs/logging/" + run_cfg["run_name"])
-    ckpt_save_dir = paths_cfg["ckpt_save_path"] + run_cfg["run_name"]
+    writer = SummaryWriter("runs/logging/" + cfg.run.run_name)
+    ckpt_save_dir = cfg.paths.ckpt_save_path + cfg.run.run_name
     if not os.path.exists(ckpt_save_dir):
         os.makedirs(ckpt_save_dir)
 
-    # Log hyperparameters to track
     hparams_text = "\n".join(
         [
-            f"sigma={reward_cfg['sigma']}",
-            f"w_rf={reward_cfg['w_rf']}",
-            f"w_qed={reward_cfg['w_qed']}",
-            f"w_sa={reward_cfg['w_sa']}",
-            f"learning_rate={training_cfg['learning_rate']}",
-            f"batch_size={training_cfg['batch_size']}",
-            f"max_length={model_cfg['max_length']}",
-            f"temperature={training_cfg['temperature']}",
-            f"top_k={training_cfg['top_k']}",
-            f"n_layer={model_cfg['n_layer']}",
-            f"n_head={model_cfg['n_head']}",
-            f"n_embd={model_cfg['n_embd']}",
+            f"sigma={cfg.reward.sigma}",
+            f"w_rf={cfg.reward.w_rf}",
+            f"w_qed={cfg.reward.w_qed}",
+            f"w_sa={cfg.reward.w_sa}",
+            f"learning_rate={cfg.training.learning_rate}",
+            f"batch_size={cfg.training.batch_size}",
+            f"max_length={cfg.model.max_length}",
+            f"temperature={cfg.training.temperature}",
+            f"top_k={cfg.training.top_k}",
+            f"n_layer={cfg.model.n_layer}",
+            f"n_head={cfg.model.n_head}",
+            f"n_embd={cfg.model.n_embd}",
         ]
     )
     writer.add_text("hparams", hparams_text, 0)
 
     set_seed(42)
 
-    voc = read_vocabulary(paths_cfg["vocab_path"])
+    voc = read_vocabulary(cfg.paths.vocab_path)
     model, optimizer = create_model(
         voc=voc,
-        n_layer=model_cfg["n_layer"],
-        n_head=model_cfg["n_head"],
-        n_embd=model_cfg["n_embd"],
-        max_length=model_cfg["max_length"],
-        learning_rate=training_cfg["learning_rate"],
+        model_cfg=cfg.model,
+        training_cfg=cfg.training,
+        paths_cfg=cfg.paths,
         device=device,
-        ckpt_load_path=paths_cfg["ckpt_load_path"],
     )
 
     ref_model = GPT(
         GPTConfig(
             voc.__len__(),
-            n_layer=model_cfg["n_layer"],
-            n_head=model_cfg["n_head"],
-            n_embd=model_cfg["n_embd"],
-            block_size=model_cfg["max_length"],
+            n_layer=cfg.model.n_layer,
+            n_head=cfg.model.n_head,
+            n_embd=cfg.model.n_embd,
+            block_size=cfg.model.max_length,
         )
     ).to(device)
 
     ref_model.load_state_dict(
-        torch.load(paths_cfg["ckpt_load_path"], map_location=device),
+        torch.load(cfg.paths.ckpt_load_path, map_location=device),
         strict=False,
     )
     ref_model.eval()
 
     active_additive_scorers = [
-        make_rf_scorer(rf_model, weight=reward_cfg["w_rf"]),
+        make_rf_scorer(rf_model, weight=cfg.reward.w_rf),
         make_ad_scorer(ad_model, weight=1.0),
-        make_qed_scorer(weight=reward_cfg["w_qed"]),
-        make_sa_scorer(weight=reward_cfg["w_sa"]),
+        make_qed_scorer(weight=cfg.reward.w_qed),
+        make_sa_scorer(weight=cfg.reward.w_sa),
     ]
 
     active_multiplier_scorers = [
@@ -319,7 +302,7 @@ def main() -> None:
     experience_buffer = ReplayBuffer(
         voc=voc,
         device=device,
-        max_length=model_cfg["max_length"],
+        max_length=cfg.model.max_length,
         buffer_size=100,
         max_per_scaffold=3,
         similarity_threshold=0.65,
@@ -330,7 +313,9 @@ def main() -> None:
         voc=voc,
         rf_model=rf_model,
         ad_model=ad_model,
-        train_smiles_set=train_smiles_set
+        train_smiles_set=train_smiles_set,
+        model_cfg=cfg.model,
+        train_cfg=cfg.training,
     )
 
     logger = TensorBoardLogger(writer)
@@ -338,15 +323,13 @@ def main() -> None:
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    for step in tqdm(range(training_cfg["max_steps"])):
+    for step in tqdm(range(cfg.training.max_steps)):
         model.train()
         smiles_list, codes = sample_smiles_nograd(
             model,
             voc=voc,
-            n_mols=training_cfg["batch_size"],
-            block_size=model_cfg["max_length"],
-            temperature=training_cfg["temperature"],
-            top_k=training_cfg["top_k"],
+            model_cfg=cfg.model,
+            train_cfg=cfg.training,
         )
 
         logprobs, _, _ = logprobs_from_codes(
@@ -359,7 +342,7 @@ def main() -> None:
             )
 
         processed_data = parallel_process_batch(
-            smiles_list, max_workers=training_cfg["max_workers"]
+            smiles_list, max_workers=cfg.training.max_workers
         )
 
         reward = compute_reward(
@@ -381,7 +364,7 @@ def main() -> None:
         )
 
         replay_codes, replay_scores, replay_priors = experience_buffer.sample(
-            batch_size=max(1, training_cfg["batch_size"] // 10)
+            batch_size=max(1, cfg.training.batch_size // 10)
         )
 
         if replay_codes is not None:
@@ -398,20 +381,22 @@ def main() -> None:
             total_scores = score
 
         # REINVENT DAP loss
-        augmented_likelihood = total_priors + (
-            reward_cfg["sigma"] * total_scores
-        )
+        augmented_likelihood = total_priors + (cfg.reward.sigma * total_scores)
         loss = 0.5 * ((total_logprobs - augmented_likelihood) ** 2).mean()
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
+        if (
+            cfg.evaluation.eval_every > 0
+            and step % cfg.evaluation.eval_every == 0
+        ):
             model.eval()
             metrics, img_np = metrics_calculator.calculate(processed_data)
             logger.log_metrics(step, metrics, img_np)
 
 
 if __name__ == "__main__":
+    main()
     main()

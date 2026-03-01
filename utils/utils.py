@@ -9,16 +9,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from config import ModelConfig, TrainingConfig
 from pretraining.vocabulary import SMILESTokenizer, Vocabulary
 
 
 def sample_smiles_nograd(
     model: nn.Module,
     voc: Vocabulary,
-    n_mols: int,
-    block_size: int,
-    temperature: float = 1.0,
-    top_k: int = 10,
+    model_cfg: ModelConfig,
+    train_cfg: TrainingConfig,
 ) -> Tuple[List[str], torch.Tensor]:
     """
     Sample SMILES strings from a trained model without tracking gradients.
@@ -34,23 +33,16 @@ def sample_smiles_nograd(
         The trained PyTorch model for SMILES generation (e.g., GPT).
     voc: Vocabulary
         The vocabulary object containing token-to-index mappings and decode methods.
-    n_mols: int
-        The number of SMILES strings to generate.
-    block_size: int
-        The maximum length of the generated SMILES strings (including start/end tokens).
-    temperature: float, default=1.0
-        The temperature for sampling. Higher values (>1.0) lead to more random samples,
-        lower values (<1.0) make the distribution sharper and more deterministic.
-    top_k: int, default=10
-        The number of top tokens to consider for sampling at each step. Limits the
-        sampling pool to the k most likely tokens.
-
+    model_cfg: ModelConfig
+        Configuration for the model architecture (e.g., n_layer, n_head, n_embd, max_length).
+    train_cfg: TrainingConfig
+        Configuration for training parameters (e.g., learning_rate, temperature, top_k).
     Returns:
     --------
     Tuple[List[str], torch.Tensor]
         A tuple containing:
         - smiles (List[str]): List of generated SMILES strings (untokenized).
-        - codes (torch.Tensor): Tensor of shape (n_mols, block_size) containing
+        - codes (torch.Tensor): Tensor of shape (batch_size, max_length) containing
           the token indices for all generated sequences.
     """
     model.eval()
@@ -58,20 +50,22 @@ def sample_smiles_nograd(
 
     with torch.no_grad():
         codes = torch.full(
-            (n_mols, block_size),
+            (train_cfg.batch_size, model_cfg.max_length),
             fill_value=voc["$"],
             dtype=torch.long,
             device=device,
         )
         codes[:, 0] = voc["^"]
-        finished = torch.zeros(n_mols, dtype=torch.bool, device=device)
+        finished = torch.zeros(
+            train_cfg.batch_size, dtype=torch.bool, device=device
+        )
 
-        for i in range(1, block_size):
+        for i in range(1, model_cfg.max_length):
             logits, _, _ = model(codes[:, :i])
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :] / train_cfg.temperature
 
-            if top_k is not None:
-                logits = top_k_logits(logits, k=top_k)
+            if train_cfg.top_k is not None:
+                logits = top_k_logits(logits, k=train_cfg.top_k)
 
             probs = logits.softmax(dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
@@ -88,7 +82,7 @@ def sample_smiles_nograd(
 
     tokenizer = SMILESTokenizer()
     smiles = []
-    for i in range(n_mols):
+    for i in range(train_cfg.batch_size):
         tokens = voc.decode(codes[i].cpu().numpy())
         smiles.append(tokenizer.untokenize(tokens))
 

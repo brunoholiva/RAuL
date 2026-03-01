@@ -4,6 +4,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import Draw
 
+from config import ModelConfig, TrainingConfig
 from scoring.activity import predict_activity_proba
 from scoring.molecular import ad_domain_score
 from utils.rdkit_utils import (
@@ -18,12 +19,23 @@ from utils.utils import sample_smiles_nograd
 class MetricsCalculator:
     """Calculates evaluation metrics for model performance."""
 
-    def __init__(self, model, voc, rf_model, ad_model, train_smiles_set):
+    def __init__(
+        self,
+        model,
+        voc,
+        rf_model,
+        ad_model,
+        train_smiles_set,
+        model_cfg: ModelConfig,
+        train_cfg: TrainingConfig,
+    ):
         self.model = model
         self.voc = voc
         self.rf_model = rf_model
         self.ad_model = ad_model
         self.train_smiles_set = train_smiles_set
+        self.model_cfg = model_cfg
+        self.train_cfg = train_cfg
 
     def calculate(
         self, processed_data: List[Dict[str, Any]]
@@ -47,7 +59,10 @@ class MetricsCalculator:
         )[mask]
 
         sampled_smiles, _ = sample_smiles_nograd(
-            self.model, voc=self.voc, n_mols=100, block_size=200, top_k=10
+            self.model,
+            voc=self.voc,
+            model_cfg=self.model_cfg,
+            train_cfg=self.train_cfg,
         )
 
         metrics["validity"] = get_validity(sampled_smiles)
