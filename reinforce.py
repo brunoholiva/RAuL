@@ -11,7 +11,7 @@ from tqdm import tqdm
 from pretraining.model import GPT, GPTConfig
 from pretraining.vocabulary import read_vocabulary
 from scoring.activity import load_rf_model
-from scoring.evaluator import Evaluator
+from scoring.evaluator import MetricsCalculator, TensorBoardLogger
 from scoring.memory import ReplayBuffer
 from scoring.molecular import load_ad_model
 from scoring.reward import (
@@ -325,14 +325,15 @@ def main() -> None:
         similarity_threshold=0.65,
     )
 
-    evaluator = Evaluator(
+    metrics_calculator = MetricsCalculator(
         model=model,
         voc=voc,
         rf_model=rf_model,
         ad_model=ad_model,
-        train_smiles_set=train_smiles_set,
-        writer=writer,
+        train_smiles_set=train_smiles_set
     )
+
+    logger = TensorBoardLogger(writer)
 
     for p in ref_model.parameters():
         p.requires_grad = False
@@ -408,7 +409,8 @@ def main() -> None:
 
         if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
             model.eval()
-            evaluator.run_evaluation(step, processed_data)
+            metrics, img_np = metrics_calculator.calculate(processed_data)
+            logger.log_metrics(step, metrics, img_np)
 
 
 if __name__ == "__main__":
