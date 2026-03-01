@@ -3,7 +3,7 @@ Utility functions for SMILES generation, sampling, and reward transformations.Ba
 """
 
 import random
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Optional, Set
 
 import numpy as np
 import torch
@@ -210,3 +210,28 @@ def sigmoid(value: float, low: float, high: float, k: float = 0.25) -> float:
 
     exponent = k * ((high + low) / 2 - value) / (high - low)
     return 1.0 / (1.0 + 10.0**exponent)
+
+
+def load_smiles_set(path: Optional[str]) -> Optional[Set[str]]:
+    """
+    Load a set of SMILES strings from a text file for fast lookup.
+
+    Parameters
+    ----------
+    path : Optional[str]
+        The file path to the SMILES list.
+
+    Returns
+    -------
+    Optional[Set[str]]
+        A set containing the SMILES strings, or None if path is None.
+    """
+    if path is None:
+        return None
+    smiles_set = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                smiles_set.add(s)
+    return smiles_set
