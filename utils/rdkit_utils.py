@@ -235,7 +235,7 @@ def get_scaffold(
         return None
 
 
-def model_uniqueness(smiles_list: List[str]) -> float:
+def get_uniqueness(smiles_list: List[str]) -> float:
     """
     Calculate the proportion of unique, valid SMILES in a list.
 
@@ -254,7 +254,7 @@ def model_uniqueness(smiles_list: List[str]) -> float:
     return len(unique_smiles) / max(1, len(valid_smiles))
 
 
-def model_novelty(smiles_list: List[str], train_smiles_set: Set[str]) -> float:
+def get_novelty(smiles_list: List[str], train_smiles_set: Set[str]) -> float:
     """
     Calculate the proportion of valid SMILES not present in training data.
 
@@ -303,7 +303,7 @@ def calculate_average_tanimoto(
     return float(np.mean(tanimoto_matrix[i, j]))
 
 
-def model_diversity(smiles_list: List[str]) -> float:
+def get_diversity(smiles_list: List[str]) -> float:
     """
     Calculate the internal diversity of a generated set of molecules.
 
@@ -331,7 +331,7 @@ def model_diversity(smiles_list: List[str]) -> float:
     return 1.0 - avg_similarity
 
 
-def model_validity(smiles_list: List[str]) -> float:
+def get_validity(smiles_list: List[str]) -> float:
     """
     Calculate the proportion of valid SMILES using native RDKit.
 

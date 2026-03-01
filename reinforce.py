@@ -29,10 +29,10 @@ from scoring.reward import (
     parallel_process_batch,
 )
 from utils.rdkit_utils import (
-    model_diversity,
-    model_novelty,
-    model_uniqueness,
-    model_validity,
+    get_diversity,
+    get_novelty,
+    get_uniqueness,
+    get_validity,
 )
 from utils.utils import sample_smiles_nograd, set_seed
 
