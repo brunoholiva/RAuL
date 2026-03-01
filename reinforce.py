@@ -3,19 +3,17 @@ import os
 from collections import OrderedDict
 from typing import Any, Optional, Set, Tuple
 
-import numpy as np
 import toml
 import torch
-from rdkit import Chem
-from rdkit.Chem import Draw
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from pretraining.model import GPT, GPTConfig
 from pretraining.vocabulary import read_vocabulary
-from scoring.activity import load_rf_model, predict_activity_proba
+from scoring.activity import load_rf_model
+from scoring.evaluator import Evaluator
 from scoring.memory import ReplayBuffer
-from scoring.molecular import ad_domain_score, load_ad_model
+from scoring.molecular import load_ad_model
 from scoring.reward import (
     apply_diversity_filter,
     compute_reward,
@@ -27,12 +25,6 @@ from scoring.reward import (
     make_sa_scorer,
     make_valid_mask,
     parallel_process_batch,
-)
-from utils.rdkit_utils import (
-    get_diversity,
-    get_novelty,
-    get_uniqueness,
-    get_validity,
 )
 from utils.utils import sample_smiles_nograd, set_seed
 
@@ -333,6 +325,15 @@ def main() -> None:
         similarity_threshold=0.65,
     )
 
+    evaluator = Evaluator(
+        model=model,
+        voc=voc,
+        rf_model=rf_model,
+        ad_model=ad_model,
+        train_smiles_set=train_smiles_set,
+        writer=writer,
+    )
+
     for p in ref_model.parameters():
         p.requires_grad = False
 
@@ -405,73 +406,9 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        writer.add_scalar("loss/dap", float(loss.item()), step)
-        writer.add_scalar(
-            "reward/mean", float(total_scores.mean().item()), step
-        )
-        writer.add_scalar("reward/max", float(total_scores.max().item()), step)
-        writer.add_scalar("reward/min", float(total_scores.min().item()), step)
-
-        if (step + 1) % 500 == 0:
-            ckpt_path = os.path.join(ckpt_save_dir, f"step_{step+1}.pt")
-            torch.save(model.state_dict(), ckpt_path)
-
         if eval_cfg["eval_every"] > 0 and step % eval_cfg["eval_every"] == 0:
-            mask = np.array([d["valid"] for d in processed_data], dtype=bool)
-
-            qed_scores = np.array(
-                [d.get("qed", 0.0) for d in processed_data], dtype=np.float32
-            )
-            sa_raw = np.array(
-                [d.get("sa", 10.0) for d in processed_data], dtype=np.float32
-            )
-
-            fps = [d["fp"] for d in processed_data]
-            std_smiles = [d.get("std_smi", "") for d in processed_data]
-
-            rf_probs = predict_activity_proba(fps, rf_model=rf_model)
-            ad_dists = ad_domain_score(fps, ad_model=ad_model)
-
-            rf_valid = rf_probs[mask]
-            ad_valid = ad_dists[mask]
-            qed_valid = qed_scores[mask]
-            sa_valid = sa_raw[mask]
-
-            if rf_valid.size > 0:
-                writer.add_histogram("rf/prob_dist", rf_valid, step)
-            if ad_valid.size > 0:
-                writer.add_histogram("ad/dist_dist", ad_valid, step)
-            if qed_valid.size > 0:
-                writer.add_histogram("qed/score_dist", qed_valid, step)
-            if sa_valid.size > 0:
-                writer.add_histogram("sa/score_dist", sa_valid, step)
-
-            sampled_smiles, _ = sample_smiles_nograd(
-                model, voc=voc, n_mols=100, block_size=200, top_k=10
-            )
-            validity = get_validity(sampled_smiles)
-            uniqueness = get_uniqueness(sampled_smiles)
-            diversity = get_diversity(sampled_smiles)
-            novelty = get_novelty(sampled_smiles, train_smiles_set)
-
-            writer.add_scalar("metrics/validity", float(validity), step)
-            writer.add_scalar("metrics/uniqueness", float(uniqueness), step)
-            writer.add_scalar("metrics/diversity", float(diversity), step)
-            writer.add_scalar("metrics/novelty", float(novelty), step)
-
-            mols = [Chem.MolFromSmiles(s) for s in sampled_smiles]
-            valid_mols = [m for m in mols if m is not None]
-            if len(valid_mols) > 0:
-                k = min(8, len(valid_mols))
-                idx = np.random.choice(len(valid_mols), size=k, replace=False)
-                mols_subset = [valid_mols[i] for i in idx]
-                img = Draw.MolsToGridImage(
-                    mols_subset, molsPerRow=4, subImgSize=(200, 200)
-                )
-                img_np = np.array(img)
-                writer.add_image(
-                    "samples/molecules", img_np, step, dataformats="HWC"
-                )
+            model.eval()
+            evaluator.run_evaluation(step, processed_data)
 
 
 if __name__ == "__main__":
