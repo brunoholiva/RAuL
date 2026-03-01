@@ -14,13 +14,19 @@ from tqdm import tqdm
 from pretraining.model import GPT, GPTConfig
 from pretraining.vocabulary import read_vocabulary
 from scoring.activity import load_rf_model, predict_activity_proba
+from scoring.memory import ReplayBuffer
 from scoring.molecular import ad_domain_score, load_ad_model
 from scoring.reward import (
     apply_diversity_filter,
     compute_reward,
+    make_ad_scorer,
+    make_mw_penalty,
+    make_pains_filter,
+    make_qed_scorer,
+    make_rf_scorer,
+    make_sa_scorer,
+    make_valid_mask,
     parallel_process_batch,
-    sample_replay_buffer,
-    update_replay_buffer,
 )
 from utils.rdkit_utils import (
     model_diversity,
@@ -304,17 +310,6 @@ def main() -> None:
         strict=False,
     )
     ref_model.eval()
-    replay_buffer = []
-
-    from scoring.reward import (
-        make_ad_scorer,
-        make_mw_penalty,
-        make_pains_filter,
-        make_qed_scorer,
-        make_rf_scorer,
-        make_sa_scorer,
-        make_valid_mask,
-    )
 
     active_additive_scorers = [
         make_rf_scorer(rf_model, weight=reward_cfg["w_rf"]),
@@ -328,6 +323,15 @@ def main() -> None:
         make_valid_mask(),
         make_pains_filter(),
     ]
+
+    experience_buffer = ReplayBuffer(
+        voc=voc,
+        device=device,
+        max_length=model_cfg["max_length"],
+        buffer_size=100,
+        max_per_scaffold=3,
+        similarity_threshold=0.65,
+    )
 
     for p in ref_model.parameters():
         p.requires_grad = False
@@ -370,20 +374,12 @@ def main() -> None:
             filtered_reward, dtype=torch.float32, device=device
         )
 
-        replay_buffer = update_replay_buffer(
-            replay_buffer,
-            processed_data,
-            filtered_reward,
-            logprobs_ref,
-            buffer_size=100,
+        experience_buffer.add_experience(
+            processed_data, filtered_reward, logprobs_ref
         )
 
-        replay_codes, replay_scores, replay_priors = sample_replay_buffer(
-            replay_buffer,
-            batch_size=max(1, training_cfg["batch_size"] // 10),
-            voc=voc,
-            device=device,
-            max_length=model_cfg["max_length"],
+        replay_codes, replay_scores, replay_priors = experience_buffer.sample(
+            batch_size=max(1, training_cfg["batch_size"] // 10)
         )
 
         if replay_codes is not None:
