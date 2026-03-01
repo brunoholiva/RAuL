@@ -449,10 +449,10 @@ def main() -> None:
             sampled_smiles, _ = sample_smiles_nograd(
                 model, voc=voc, n_mols=100, block_size=200, top_k=10
             )
-            validity = model_validity(sampled_smiles)
-            uniqueness = model_uniqueness(sampled_smiles)
-            diversity = model_diversity(sampled_smiles)
-            novelty = model_novelty(sampled_smiles, train_smiles_set)
+            validity = get_validity(sampled_smiles)
+            uniqueness = get_uniqueness(sampled_smiles)
+            diversity = get_diversity(sampled_smiles)
+            novelty = get_novelty(sampled_smiles, train_smiles_set)
 
             writer.add_scalar("metrics/validity", float(validity), step)
             writer.add_scalar("metrics/uniqueness", float(uniqueness), step)
