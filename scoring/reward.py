@@ -190,7 +190,7 @@ def apply_diversity_filter(
     raw_scores: Any,
     global_memory: Dict[str, Any],
     bucket_size: int = 25,
-    min_score: float = 0.4,
+    min_score: float = None,
     min_similarity: float = 0.4,
 ) -> List[float]:
     """
@@ -219,6 +219,9 @@ def apply_diversity_filter(
     final_scores = []
     local_smiles_seen = set()
     MAX_MEMORY_SIZE = 5000
+
+    if min_score is None:
+        min_score = float(np.median(raw_scores))
 
     mem_keys = list(global_memory.keys())
     mem_fps = [global_memory[k]["fp"] for k in mem_keys]
