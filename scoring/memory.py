@@ -106,7 +106,7 @@ class ReplayBuffer:
         scores, smiles, prior_logprobs, _ = zip(*sampled_items)
         tokenizer = SMILESTokenizer()
 
-        codes = torch.full(
+        token_ids = torch.full(
             (n_samples, self.max_length),
             self.voc["$"],
             dtype=torch.long,
@@ -121,7 +121,7 @@ class ReplayBuffer:
             if len(full_seq) > self.max_length:
                 full_seq = full_seq[: self.max_length]
 
-            codes[i, : len(full_seq)] = torch.tensor(
+            token_ids[i, : len(full_seq)] = torch.tensor(
                 full_seq, dtype=torch.long, device=self.device
             )
 
@@ -132,4 +132,4 @@ class ReplayBuffer:
             prior_logprobs, dtype=torch.float32, device=self.device
         )
 
-        return codes, scores_tensor, priors_tensor
+        return token_ids, scores_tensor, priors_tensor

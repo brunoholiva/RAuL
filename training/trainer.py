@@ -14,7 +14,167 @@ from scoring.reward import (
     compute_reward,
     parallel_process_batch,
 )
+from training.datatypes import GeneratedExperience
 from utils.utils import sample_smiles_nograd
+
+
+class RLTrainer:
+    """Handles the execution of the Reinforcement Learning loop."""
+
+    def __init__(
+        self,
+        cfg: ExperimentConfig,
+        model: GPT,
+        ref_model: GPT,
+        optimizer: torch.optim.Optimizer,
+        voc: Any,
+        experience_buffer: ReplayBuffer,
+        metrics_calculator: MetricsCalculator,
+        logger: TensorBoardLogger,
+        additive_scorers: list,
+        multiplier_scorers: list,
+        device: torch.device,
+    ):
+        self.cfg = cfg
+        self.model = model
+        self.ref_model = ref_model
+        self.optimizer = optimizer
+        self.voc = voc
+        self.experience_buffer = experience_buffer
+        self.metrics_calculator = metrics_calculator
+        self.logger = logger
+        self.additive_scorers = additive_scorers
+        self.multiplier_scorers = multiplier_scorers
+        self.device = device
+        self.global_scaffold_memory = OrderedDict()
+
+    def train(self):
+        """The core RL loop."""
+        for p in self.ref_model.parameters():
+            p.requires_grad = False
+
+        for step in tqdm(range(self.cfg.training.max_steps)):
+            self.model.train()
+
+            experience = self._generate_experience()
+
+            processed_data = parallel_process_batch(
+                experience.smiles, max_workers=self.cfg.training.max_workers
+            )
+
+            reward = compute_reward(
+                processed_data,
+                additive_scorers=self.additive_scorers,
+                multiplier_scorers=self.multiplier_scorers,
+            )
+
+            filtered_reward = apply_diversity_filter(
+                processed_data,
+                reward,
+                self.global_scaffold_memory,
+                bucket_size=25,
+            )
+
+            score = torch.tensor(
+                filtered_reward, dtype=torch.float32, device=self.device
+            )
+
+            self.experience_buffer.add_experience(
+                processed_data, filtered_reward, experience.logprobs_ref
+            )
+
+            total_logprobs, total_priors, total_scores = (
+                self._combine_current_and_replay(experience, score)
+            )
+            loss = self._compute_DAP_loss(total_logprobs, total_priors, total_scores)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+
+            if (
+                self.cfg.evaluation.eval_every > 0
+                and step % self.cfg.evaluation.eval_every == 0
+            ):
+                self.model.eval()
+                metrics, img_np = self.metrics_calculator.calculate(processed_data)
+                self.logger.log_metrics(step, metrics, img_np)
+            if (
+                self.cfg.training.save_every > 0
+                and step % self.cfg.training.save_every == 0
+            ):
+                self._save_checkpoint(step)
+
+    def _generate_experience(self) -> GeneratedExperience:
+        """
+        Generate a batch of SMILES sequences and compute their log probabilities
+        under both the current model and the reference model.
+        """
+        smiles_list, token_ids = sample_smiles_nograd(
+            model=self.model,
+            voc=self.voc,
+            model_cfg=self.cfg.model,
+            train_cfg=self.cfg.training,
+        )
+
+        logprobs, _, _ = logprobs_from_token_ids(
+            self.model, token_ids, self.voc, train_mode=True
+        )
+
+        with torch.no_grad():
+            logprobs_ref, _, _ = logprobs_from_token_ids(
+                self.ref_model, token_ids, self.voc, train_mode=False
+            )
+
+        return GeneratedExperience(
+            smiles=smiles_list,
+            token_ids=token_ids,
+            logprobs=logprobs,
+            logprobs_ref=logprobs_ref,
+        )
+
+    def _combine_current_and_replay(
+        self, experience: GeneratedExperience, score: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Combine current experience logprobs and scores with replay buffer samples."""
+        replay_token_ids, replay_scores, replay_priors = self.experience_buffer.sample(
+            batch_size=max(1, self.cfg.training.batch_size // 10)
+        )
+
+        if replay_token_ids is not None:
+            replay_logprobs, _, _ = logprobs_from_token_ids(
+                self.model, replay_token_ids, self.voc, train_mode=True
+            )
+            total_logprobs = torch.cat([experience.logprobs, replay_logprobs])
+            total_priors = torch.cat([experience.logprobs_ref, replay_priors])
+            total_scores = torch.cat([score, replay_scores])
+        else:
+            total_logprobs = experience.logprobs
+            total_priors = experience.logprobs_ref
+            total_scores = score
+
+        return total_logprobs, total_priors, total_scores
+
+    def _compute_DAP_loss(
+        self,
+        logprobs: torch.Tensor,
+        priors: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Computes the Difference between Augmented and Posterior (DAP) loss."""
+        augmented_likelihood = priors + (self.cfg.reward.sigma * scores)
+        loss = 0.5 * ((logprobs - augmented_likelihood) ** 2).mean()
+        return loss
+
+    def _save_checkpoint(self, step: int) -> None:
+        """Save the model checkpoint at the specified training step."""
+        save_dir = os.path.join(self.cfg.paths.ckpt_save_path, self.cfg.run.run_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, f"checkpoint_step_{step}.pt")
+
+        torch.save(self.model.state_dict(), save_path)
 
 
 def _sequence_mask(target: torch.Tensor, eos_token_id: int) -> torch.Tensor:
@@ -62,9 +222,7 @@ def _token_logprobs(
     return log_probs, gathered_logprobs
 
 
-def _sequence_entropy(
-    logits: torch.Tensor, not_finished: torch.Tensor
-) -> torch.Tensor:
+def _sequence_entropy(logits: torch.Tensor, not_finished: torch.Tensor) -> torch.Tensor:
     """
     Calculate the mean Shannon entropy of the generated sequence.
 
@@ -88,20 +246,20 @@ def _sequence_entropy(
     return (token_entropy.sum(dim=1) / seq_lengths).mean()
 
 
-def logprobs_from_codes(
+def logprobs_from_token_ids(
     model: torch.nn.Module,
-    codes: torch.Tensor,
+    token_ids: torch.Tensor,
     voc: Any,
     train_mode: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute log probabilities and entropy for a batch of token codes.
+    Compute log probabilities and entropy for a batch of token token_ids.
 
     Parameters
     ----------
     model : torch.nn.Module
         The GPT model.
-    codes : torch.Tensor
+    token_ids : torch.Tensor
         The token sequences to evaluate.
     voc : Any
         The vocabulary object.
@@ -114,9 +272,9 @@ def logprobs_from_codes(
         Sequence log probabilities, sequence entropy, and value estimates.
     """
     model.train() if train_mode else model.eval()
-    logits, values, _ = model(codes[:, :-1])
+    logits, values, _ = model(token_ids[:, :-1])
 
-    target = codes[:, 1:]
+    target = token_ids[:, 1:]
     not_finished = _sequence_mask(target, voc["$"])
 
     _, token_logprobs = _token_logprobs(logits, target)
@@ -127,132 +285,3 @@ def logprobs_from_codes(
 
     return logprobs, entropy, values
 
-
-class RLTrainer:
-    """Handles the execution of the Reinforcement Learning loop."""
-
-    def __init__(
-        self,
-        cfg: ExperimentConfig,
-        model: GPT,
-        ref_model: GPT,
-        optimizer: torch.optim.Optimizer,
-        voc: Any,
-        experience_buffer: ReplayBuffer,
-        metrics_calculator: MetricsCalculator,
-        logger: TensorBoardLogger,
-        additive_scorers: list,
-        multiplier_scorers: list,
-        device: torch.device,
-    ):
-        self.cfg = cfg
-        self.model = model
-        self.ref_model = ref_model
-        self.optimizer = optimizer
-        self.voc = voc
-        self.experience_buffer = experience_buffer
-        self.metrics_calculator = metrics_calculator
-        self.logger = logger
-        self.additive_scorers = additive_scorers
-        self.multiplier_scorers = multiplier_scorers
-        self.device = device
-        self.global_scaffold_memory = OrderedDict()
-
-    def _save_checkpoint(self, step: int) -> None:
-        save_dir = os.path.join(
-            self.cfg.paths.ckpt_save_path, self.cfg.run.run_name
-        )
-        os.makedirs(save_dir, exist_ok=True)
-
-        save_path = os.path.join(save_dir, f"checkpoint_step_{step}.pt")
-
-        torch.save(self.model.state_dict(), save_path)
-
-    def train(self):
-        """The core RL loop."""
-        for p in self.ref_model.parameters():
-            p.requires_grad = False
-
-        for step in tqdm(range(self.cfg.training.max_steps)):
-            self.model.train()
-
-            smiles_list, codes = sample_smiles_nograd(
-                model=self.model,
-                voc=self.voc,
-                model_cfg=self.cfg.model,
-                train_cfg=self.cfg.training,
-            )
-
-            logprobs, _, _ = logprobs_from_codes(
-                self.model, codes, self.voc, train_mode=True
-            )
-
-            with torch.no_grad():
-                logprobs_ref, _, _ = logprobs_from_codes(
-                    self.ref_model, codes, self.voc, train_mode=False
-                )
-
-            processed_data = parallel_process_batch(
-                smiles_list, max_workers=self.cfg.training.max_workers
-            )
-
-            reward = compute_reward(
-                processed_data,
-                additive_scorers=self.additive_scorers,
-                multiplier_scorers=self.multiplier_scorers,
-            )
-
-            filtered_reward = apply_diversity_filter(
-                processed_data,
-                reward,
-                self.global_scaffold_memory,
-                bucket_size=25,
-            )
-
-            score = torch.tensor(
-                filtered_reward, dtype=torch.float32, device=self.device
-            )
-
-            self.experience_buffer.add_experience(
-                processed_data, filtered_reward, logprobs_ref
-            )
-
-            replay_codes, replay_scores, replay_priors = (
-                self.experience_buffer.sample(
-                    batch_size=max(1, self.cfg.training.batch_size // 10)
-                )
-            )
-
-            if replay_codes is not None:
-                replay_logprobs, _, _ = logprobs_from_codes(
-                    self.model, replay_codes, self.voc, train_mode=True
-                )
-                total_logprobs = torch.cat([logprobs, replay_logprobs])
-                total_priors = torch.cat([logprobs_ref, replay_priors])
-                total_scores = torch.cat([score, replay_scores])
-            else:
-                total_logprobs = logprobs
-                total_priors = logprobs_ref
-                total_scores = score
-
-            augmented_likelihood = total_priors + (
-                self.cfg.reward.sigma * total_scores
-            )
-            loss = 0.5 * ((total_logprobs - augmented_likelihood) ** 2).mean()
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-
-            if (
-                self.cfg.evaluation.eval_every > 0
-                and step % self.cfg.evaluation.eval_every == 0
-            ):
-                self.model.eval()
-                metrics, img_np = self.metrics_calculator.calculate(
-                    processed_data
-                )
-                self.logger.log_metrics(step, metrics, img_np)
-            if self.cfg.training.save_every > 0 and step % self.cfg.training.save_every == 0:
-                self._save_checkpoint(step)

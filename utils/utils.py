@@ -42,26 +42,26 @@ def sample_smiles_nograd(
     Tuple[List[str], torch.Tensor]
         A tuple containing:
         - smiles (List[str]): List of generated SMILES strings (untokenized).
-        - codes (torch.Tensor): Tensor of shape (batch_size, max_length) containing
+        - token_ids (torch.Tensor): Tensor of shape (batch_size, max_length) containing
           the token indices for all generated sequences.
     """
     model.eval()
     device = next(model.parameters()).device
 
     with torch.no_grad():
-        codes = torch.full(
+        token_ids = torch.full(
             (train_cfg.batch_size, model_cfg.max_length),
             fill_value=voc["$"],
             dtype=torch.long,
             device=device,
         )
-        codes[:, 0] = voc["^"]
+        token_ids[:, 0] = voc["^"]
         finished = torch.zeros(
             train_cfg.batch_size, dtype=torch.bool, device=device
         )
 
         for i in range(1, model_cfg.max_length):
-            logits, _, _ = model(codes[:, :i])
+            logits, _, _ = model(token_ids[:, :i])
             logits = logits[:, -1, :] / train_cfg.temperature
 
             if train_cfg.top_k is not None:
@@ -74,7 +74,7 @@ def sample_smiles_nograd(
                 finished, torch.full_like(next_token, voc["$"]), next_token
             )
 
-            codes[:, i] = next_token
+            token_ids[:, i] = next_token
             finished |= next_token == voc["$"]
 
             if finished.all():
@@ -83,10 +83,10 @@ def sample_smiles_nograd(
     tokenizer = SMILESTokenizer()
     smiles = []
     for i in range(train_cfg.batch_size):
-        tokens = voc.decode(codes[i].cpu().numpy())
+        tokens = voc.decode(token_ids[i].cpu().numpy())
         smiles.append(tokenizer.untokenize(tokens))
 
-    return smiles, codes
+    return smiles, token_ids
 
 
 def set_seed(seed: int) -> None:
