@@ -120,7 +120,7 @@ def main() -> None:
 
     active_additive_scorers = [
         make_rf_scorer(rf_model, weight=cfg.reward.w_rf),
-        make_ad_scorer(ad_model, weight=1.0),
+        #make_ad_scorer(ad_model, weight=1.0),
         make_qed_scorer(weight=cfg.reward.w_qed),
         make_sa_scorer(weight=cfg.reward.w_sa),
     ]
