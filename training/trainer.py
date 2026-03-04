@@ -1,3 +1,4 @@
+import os
 from collections import OrderedDict
 from typing import Any, Tuple
 
@@ -157,6 +158,16 @@ class RLTrainer:
         self.device = device
         self.global_scaffold_memory = OrderedDict()
 
+    def _save_checkpoint(self, step: int) -> None:
+        save_dir = os.path.join(
+            self.cfg.paths.ckpt_save_path, self.cfg.run.run_name
+        )
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, f"checkpoint_step_{step}.pt")
+
+        torch.save(self.model.state_dict(), save_path)
+
     def train(self):
         """The core RL loop."""
         for p in self.ref_model.parameters():
@@ -243,3 +254,5 @@ class RLTrainer:
                     processed_data
                 )
                 self.logger.log_metrics(step, metrics, img_np)
+            if self.cfg.training.save_every > 0 and step % self.cfg.training.save_every == 0:
+                self._save_checkpoint(step)

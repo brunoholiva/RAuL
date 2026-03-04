@@ -20,6 +20,7 @@ class TrainingConfig:
     temperature: float
     top_k: int
     max_workers: int
+    save_every: int
 
 
 @dataclass
