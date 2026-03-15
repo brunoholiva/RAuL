@@ -3,8 +3,10 @@
 import torch
 import numpy as np
 from tqdm import tqdm
-
-from utils import randomize_smiles
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
+from utils.rdkit_utils import randomize_smiles
 
 class Dataset(torch.utils.data.Dataset):
     # Custom PyTorch Dataset for SMILES

@@ -1,200 +1,244 @@
-# base code and pre training loop adapted from https://github.com/HXYfighter/ACARL
-
-import os
-import numpy as np
 import argparse
-from tqdm import tqdm
-
+import os
+import sys
+import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
-
-from vocabulary import SMILESTokenizer, read_vocabulary, create_vocabulary
-from dataset import Dataset
-from model import GPT, GPTConfig
-from utils import model_validity, model_uniqueness, model_novelty, model_diversity, set_seed
+from tqdm import tqdm
 
 
-def load_data(data_path):
-    """Load SMILES data from text file.
-    
-    Args:
-        data_path: Path to text file with one SMILES per line
-    
-    Returns:
-        List of SMILES strings
-    """
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
+
+from pretraining.dataset import Dataset
+from pretraining.model import GPT, GPTConfig
+from pretraining.vocabulary import SMILESTokenizer, create_vocabulary, read_vocabulary
+from config import ModelConfig, TrainingConfig
+from utils.rdkit_utils import get_diversity, get_novelty, get_uniqueness, get_validity
+from utils.utils import set_seed, sample_smiles_nograd
+
+
+def load_data(data_path: str) -> list[str]:
+    """Load SMILES data from text file."""
     with open(data_path, "r") as file:
-        data = [line.rstrip() for line in file.readlines()]
-    return data
+        return [line.rstrip() for line in file.readlines()]
 
 
-def create_model(model_type, vocab_size, n_layer, n_head, n_embd, max_length, learning_rate, ckpt_load_path=None):
-    """Create model and optimizer.
-    
-    Args:
-        model_type: Type of model ('gpt' or 'rnn')
-        vocab_size: Size of vocabulary
-        n_layer: Number of transformer layers
-        n_head: Number of attention heads
-        n_embd: Embedding dimension
-        max_length: Maximum sequence length
-        learning_rate: Learning rate for optimizer
-        ckpt_load_path: Path to checkpoint to load (optional)
-    
-    Returns:
-        Tuple of (model, optimizer)
-    """
-    if model_type == "gpt":
-        model_config = GPTConfig(vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=max_length)
-        model = GPT(model_config).to("cuda")
-        optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=learning_rate, betas=(0.9, 0.95))
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-    
-    if ckpt_load_path is not None:
-        print(f"Loading checkpoint from {ckpt_load_path}")
-        model.load_state_dict(torch.load(ckpt_load_path), strict=True)
-    
-    return model, optimizer
-
-
-def get_lr(it, total_it):
-    warmup_iters = args.warmup * total_it
-    if it < warmup_iters: # linear warmup        
-        lr_mult = it / warmup_iters
-    else: # cosine learning rate decay        
-        decay_ratio  = (it - warmup_iters) / (total_it - warmup_iters)
-        lr_mult = max(0.1, 0.5 * (1.0 + np.cos(np.pi * decay_ratio)))
-    return args.learning_rate * lr_mult
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', type=str, default="gpt")
-    parser.add_argument('--run_name', type=str, help="name for tensorboard run", required=True)
-    parser.add_argument('--data_path', type=str, help="path to SMILES text file", required=True)
-    parser.add_argument('--n_layer', type=int, default=8, help="number of layers", required=False)
-    parser.add_argument('--n_head', type=int, default=8, help="number of heads", required=False)
-    parser.add_argument('--n_embd', type=int, default=256, help="embedding dimension", required=False)
-    parser.add_argument('--max_epochs', type=int, default=10, help="total epochs", required=False)
-    parser.add_argument('--batch_size', type=int, default=200, help="batch size", required=False)
-    parser.add_argument('--learning_rate', type=float, default=1e-3, help="learning rate", required=False)
-    parser.add_argument('--lr_decay', type=bool, default=True, help="whether learning rate decays", required=False) 
-    parser.add_argument('--warmup', type=float, default=0.01, help="warmup iters", required=False) 
-    parser.add_argument('--weight_decay', type=float, default=0.1, help="weight decay", required=False)
-    parser.add_argument('--grad_norm_clip', type=float, default=1.0, help="gradient normalization clip", required=False) 
-    parser.add_argument('--aug_prob', type=float, default=0.5, help="probablity of augmentation", required=False)
-    parser.add_argument('--max_length', type=int, default=200, help="max length of SMILES", required=False)
-    parser.add_argument('--vocab_path', type=str, required=False)
-    parser.add_argument('--train_split', type=float, default=0.9, help="train/val split ratio", required=False)
-    parser.add_argument('--ckpt_load_path', type=str, default=None, required=False)
-    parser.add_argument('--ckpt_save_path', type=str, default="ckpt/", required=False)
-    # parser.add_argument('--local_rank', type=int, help="local gpu id", required=False)
-    args = parser.parse_args()
-    
-    writer = SummaryWriter("runs/" + args.run_name)
-    if not os.path.exists(args.ckpt_save_path + args.run_name):
-        os.makedirs(args.ckpt_save_path + args.run_name)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    set_seed(42)
-    
-    # Load dataset
-    data = load_data(args.data_path)
-    print(f"Loaded {len(data)} SMILES from {args.data_path}")
-
-    # Vocabulary
-    if args.vocab_path != None:
-        voc = read_vocabulary(args.vocab_path)
-        print("Read vocabulary from: ", args.vocab_path)
-    else:
-        voc = create_vocabulary(data, tokenizer=SMILESTokenizer())
-        print("Parse vocabulary from dataset")
-        tokens = voc.tokens()
-        f = open("new_vocab.txt", "w")
-        for t in tokens:
-            f.write(t + '\n')
-
-    # Split train / val set
-    split_idx = int(args.train_split * len(data))
-    train_data = data[:split_idx]
-    val_data = data[split_idx:]
-    train_smiles_set = set(train_data)
-    train_dataset = Dataset(smiles_list=train_data, vocabulary=voc, tokenizer=SMILESTokenizer(), aug_prob=args.aug_prob)
-    val_dataset = Dataset(smiles_list=val_data, vocabulary=voc, tokenizer=SMILESTokenizer())
-    print("Training size: ", train_dataset.__len__(), ", Validation size: ", val_dataset.__len__())
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, collate_fn=Dataset.collate_fn)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, collate_fn=Dataset.collate_fn)
-
-    # Model
-    model, optimizer = create_model(
-        model_type=args.model_type,
-        vocab_size=voc.__len__(),
+def create_model(args, vocab_size: int, device: torch.device):
+    """Encapsulates model and optimizer creation."""
+    model_config = GPTConfig(
+        vocab_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
-        max_length=args.max_length,
-        learning_rate=args.learning_rate,
-        ckpt_load_path=args.ckpt_load_path
+        block_size=args.max_length,
+    )
+    model = GPT(model_config).to(device)
+    optimizer = model.configure_optimizers(
+        weight_decay=args.weight_decay, learning_rate=args.learning_rate, betas=(0.9, 0.95)
     )
 
-    scaler = torch.cuda.amp.GradScaler()
-    model = torch.nn.DataParallel(model, device_ids=[0])
+    if args.ckpt_load_path is not None:
+        print(f"Loading checkpoint from {args.ckpt_load_path}")
+        model.load_state_dict(torch.load(args.ckpt_load_path, map_location=device), strict=True)
 
-    num_batches = len(train_loader)
-    for epoch in tqdm(range(args.max_epochs)):
-        # training
-        model.train()
-        pbar = tqdm(enumerate(train_loader), total=num_batches, leave=False)
-        for iter_num, (x, y) in pbar:
-            x = x.to(device)
-            y = y.to(device)
+    return model, optimizer
 
-            lr = get_lr(iter_num + num_batches * epoch, num_batches * args.max_epochs) if args.lr_decay else args.learning_rate
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-            writer.add_scalar('learning rate', lr, iter_num + num_batches * epoch)
 
-            with torch.cuda.amp.autocast():
-                with torch.set_grad_enabled(True):
-                    logits, _, loss = model(x, y)
-                    loss = loss.mean()
-            model.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            # optimizer.zero_grad()
-            # loss.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm_clip)
-            # optimizer.step()
+class Pretrainer:
+    """
+    Handles the pretraining loop. 
+    Encapsulates state to prevent passing loose variables between functions.
+    """
+    def __init__(self, model, optimizer, train_loader, val_loader, voc, train_smiles_set, args, device, writer):
+        self.model = model
+        self.optimizer = optimizer
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.voc = voc
+        self.train_smiles_set = train_smiles_set
+        self.args = args
+        self.device = device
+        self.writer = writer
+        
+        self.scaler = torch.amp.GradScaler(device="cuda")
+        self.num_batches = len(train_loader)
+        
+        self.eval_model_cfg = ModelConfig(
+            n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd, max_length=args.max_length
+        )
+        self.eval_train_cfg = TrainingConfig(
+            batch_size=256, max_steps=0, learning_rate=0.0, temperature=1.0, top_k=10, max_workers=1, save_every=0
+        )
 
-            pbar.set_description(f"epoch {epoch + 1}, iter {iter_num}: train loss {loss.item():.5f}, lr {lr:e}")
-            writer.add_scalar('training loss', loss, iter_num + num_batches * epoch)
-            if (iter_num + num_batches * epoch) % 1000 == 0:
-                validity = model_validity(model, vocab_path=args.vocab_path, block_size=args.max_length)
-                writer.add_scalar('SMILES validity', validity, iter_num + num_batches * epoch)
-                uniqueness = model_uniqueness(model, vocab_path=args.vocab_path, block_size=args.max_length)
-                writer.add_scalar('SMILES uniqueness', uniqueness, iter_num + num_batches * epoch)
-                novelty = model_novelty(model, vocab_path=args.vocab_path, train_smiles_set=train_smiles_set, block_size=args.max_length)
-                writer.add_scalar('SMILES novelty', novelty, iter_num + num_batches * epoch)
-                diversity = model_diversity(model, vocab_path=args.vocab_path, block_size=args.max_length)
-                writer.add_scalar('SMILES diversity', diversity, iter_num + num_batches * epoch)
-                model.train()
+    def _get_lr(self, it: int, total_it: int) -> float:
+        """Calculates learning rate with linear warmup and cosine decay."""
+        warmup_iters = self.args.warmup * total_it
+        if it < warmup_iters:
+            lr_mult = it / max(1, warmup_iters)
+        else:
+            decay_ratio = (it - warmup_iters) / max(1, (total_it - warmup_iters))
+            lr_mult = max(0.1, 0.5 * (1.0 + np.cos(np.pi * decay_ratio)))
+        return self.args.learning_rate * lr_mult
 
-        # validation
-        model.eval()
+    def _evaluate_metrics(self, step: int):
+        """Samples smiles and calculates chemical metrics."""
+        self.model.eval()
+        
+        base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        
+        smiles, _ = sample_smiles_nograd(
+            base_model, self.voc, self.eval_model_cfg, self.eval_train_cfg
+        )
+
+        validity = get_validity(smiles)
+        uniqueness = get_uniqueness(smiles)
+        novelty = get_novelty(smiles, self.train_smiles_set)
+        diversity = get_diversity(smiles)
+
+        self.writer.add_scalar("SMILES validity", validity, step)
+        self.writer.add_scalar("SMILES uniqueness", uniqueness, step)
+        self.writer.add_scalar("SMILES novelty", novelty, step)
+        self.writer.add_scalar("SMILES diversity", diversity, step)
+        
+        self.model.train()
+
+    def _validate(self, epoch: int):
+        """Runs the validation loop and logs loss."""
+        self.model.eval()
         val_losses = []
         with torch.no_grad():
-            for iter_num, (x, y) in enumerate(val_loader):
-                x = x.to(device)
-                y = y.to(device)
-                logits, _, loss = model(x, y)
-                loss = loss.mean()
-                val_losses.append(loss.item())
+            for x, y in self.val_loader:
+                x, y = x.to(self.device), y.to(self.device)
+                _, _, loss = self.model(x, y)
+                val_losses.append(loss.mean().item())
+                
         val_loss = float(np.mean(val_losses))
-        writer.add_scalar('validation loss', loss, epoch)
+        self.writer.add_scalar("validation loss", val_loss, epoch)
+        print(f"Epoch {epoch + 1} Validation Loss: {val_loss:.5f}")
 
-        # save checkpoint
-        torch.save(model.module.state_dict(), args.ckpt_save_path + args.run_name + "/" + f"epoch{epoch}.pt")
+    def _save_checkpoint(self, epoch: int):
+        """Saves the model state dict."""
+        save_dir = os.path.join(self.args.ckpt_save_path, self.args.run_name)
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"epoch{epoch}.pt")
+        
+        base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        torch.save(base_model.state_dict(), save_path)
+
+    def train(self):
+        """Main training loop."""
+        total_iters = self.num_batches * self.args.max_epochs
+
+        for epoch in range(self.args.max_epochs):
+            self.model.train()
+            pbar = tqdm(enumerate(self.train_loader), total=self.num_batches, leave=False)
+            
+            for iter_num, (x, y) in pbar:
+                step = iter_num + self.num_batches * epoch
+                x, y = x.to(self.device), y.to(self.device)
+
+                lr = self._get_lr(step, total_iters) if self.args.lr_decay else self.args.learning_rate
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = lr
+                self.writer.add_scalar("learning rate", lr, step)
+
+                with torch.amp.autocast(device_type=self.device.type):
+                    _, _, loss = self.model(x, y)
+                    loss = loss.mean()
+                    
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_norm_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+                # Logging & Evaluation
+                pbar.set_description(f"epoch {epoch + 1}, iter {iter_num}: train loss {loss.item():.5f}, lr {lr:e}")
+                self.writer.add_scalar("training loss", loss.item(), step)
+                
+                if step % 1000 == 0 and step > 0:
+                    self._evaluate_metrics(step)
+
+            self._validate(epoch)
+            self._save_checkpoint(epoch)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_name", type=str, required=True)
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--n_layer", type=int, default=8)
+    parser.add_argument("--n_head", type=int, default=8)
+    parser.add_argument("--n_embd", type=int, default=256)
+    parser.add_argument("--max_epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=200)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--lr_decay", type=bool, default=True)
+    parser.add_argument("--warmup", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--grad_norm_clip", type=float, default=1.0)
+    parser.add_argument("--aug_prob", type=float, default=0.5)
+    parser.add_argument("--max_length", type=int, default=200)
+    parser.add_argument("--vocab_path", type=str, required=False)
+    parser.add_argument("--train_split", type=float, default=0.9)
+    parser.add_argument("--ckpt_load_path", type=str, default=None)
+    parser.add_argument("--ckpt_save_path", type=str, default="ckpt/")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    set_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    writer = SummaryWriter(os.path.join("runs/logging", args.run_name))
+
+    print(f"Loading data from {args.data_path}...")
+    data = load_data(args.data_path)
+    
+    if args.vocab_path:
+        voc = read_vocabulary(args.vocab_path)
+        print("Read vocabulary from:", args.vocab_path)
+    else:
+        voc = create_vocabulary(data, tokenizer=SMILESTokenizer())
+        print("Parsed vocabulary from dataset")
+        with open("new_vocab.txt", "w") as f:
+            for t in voc.tokens():
+                f.write(t + "\n")
+
+    split_idx = int(args.train_split * len(data))
+    train_data, val_data = data[:split_idx], data[split_idx:]
+    train_smiles_set = set(train_data)
+
+    train_loader = torch.utils.data.DataLoader(
+        Dataset(train_data, voc, SMILESTokenizer(), aug_prob=args.aug_prob),
+        batch_size=args.batch_size, shuffle=True, pin_memory=True, collate_fn=Dataset.collate_fn,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        Dataset(val_data, voc, SMILESTokenizer()),
+        batch_size=args.batch_size, shuffle=False, pin_memory=True, collate_fn=Dataset.collate_fn,
+    )
+
+    model, optimizer = create_model(args, len(voc), device)
+    if torch.cuda.is_available():
+        model = torch.nn.DataParallel(model)
+
+    trainer = Pretrainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        voc=voc,
+        train_smiles_set=train_smiles_set,
+        args=args,
+        device=device,
+        writer=writer
+    )
+    
+    print("Starting training...")
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
